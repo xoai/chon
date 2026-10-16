@@ -1,7 +1,12 @@
 # chon
 
-Serving code for **Chon** typed-decision models, such as
-[Chon-1.0-12B](https://huggingface.co/ninhnv/chon-1.0-12b).
+Serving code for **Chon** typed-decision models:
+
+| Model | Base model | GPU memory (bf16) | Notes |
+|---|---|---|---|
+| [Chon-1.0-12B](https://huggingface.co/ninhnv/chon-1.0-12b) | `google/gemma-4-12B-it` | about 40 GB | most accurate |
+| [Chon-1.0-E4B](https://huggingface.co/ninhnv/chon-1.0-e4b) | `google/gemma-4-E4B-it` | 24 GB or more | smaller; also runs on CPU |
+| [Chon-1.0-E2B](https://huggingface.co/ninhnv/chon-1.0-e2b) | `google/gemma-4-E2B-it` | 16 GB or more | smallest and fastest; also runs on CPU |
 
 Given a state (text, JSON or a conversation) and one question with a closed set of options, a Chon model
 returns a calibrated probability for every option:
@@ -19,9 +24,8 @@ JevBench `typesafe` adapter, work unchanged.
 pip install "chon[serve] @ git+https://github.com/xoai/chon"
 ```
 
-Tested with Python 3.12, torch 2.9.1 (CUDA 12.8), transformers 5.19.0 and peft 0.18.1, on one NVIDIA
-H100 80 GB. Chon-1.0-12B needs about 40 GB of GPU memory in bf16. Access to the base model
-`google/gemma-4-12B-it` on Hugging Face is required.
+Tested with Python 3.12, torch 2.9.1 (CUDA 12.8), transformers 5.19-5.20 and peft 0.18.1, on one NVIDIA
+H100 80 GB. Access to the model's Gemma 4 base model on Hugging Face is required.
 
 ## Serve
 
@@ -44,6 +48,20 @@ Options:
 - `--host`, `--port`: where to listen.
 - `CHON_API_KEY`: if set in the environment, requests must send `Authorization: Bearer <key>`.
 - `--quantize fp8`: optional FP8 weights (needs `chon[fp8]`). Re-check accuracy if you use it.
+- `--no-think`: always answer in a single forward pass, even for a model whose `chon_config.json` turns on
+  a short extra pass for unsure questions.
+
+### On CPU
+
+The E4B and E2B models also run without a GPU:
+
+```bash
+python -m chon.serve --model ninhnv/chon-1.0-e2b --device cpu --port 8000
+python -m chon.serve --model ninhnv/chon-1.0-e4b --device cpu --no-think --port 8000
+```
+
+Use `--no-think` for Chon-1.0-E4B on CPU: its extra pass for unsure questions generates text, which is
+slow without a GPU. Each model card reports CPU response times.
 
 ## Request and response
 

@@ -43,6 +43,15 @@ def load_causal_lm(path: str, dtype="bfloat16", device_map=None, attn_implementa
         kwargs["device_map"] = device_map
     if attn_implementation:
         kwargs["attn_implementation"] = attn_implementation
+    if isinstance(attn_implementation, str) and attn_implementation != "eager":
+        try:  # towers without SDPA support (Gemma 4 E2B/E4B audio encoder) get eager; the text decoder keeps it
+            from transformers import AutoConfig
+
+            subs = list(getattr(AutoConfig.from_pretrained(path), "sub_configs", {}) or {})
+            if any("audio" in k for k in subs):
+                kwargs["attn_implementation"] = {k: ("eager" if "audio" in k else attn_implementation) for k in subs}
+        except Exception:  # noqa: BLE001  (config unreadable here: let from_pretrained report it)
+            pass
     try:
         model = AutoModelForCausalLM.from_pretrained(path, **kwargs)
     except (ValueError, KeyError) as first:  # vision-language checkpoints (e.g. Qwen3.6+) register elsewhere
