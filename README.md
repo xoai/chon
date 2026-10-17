@@ -5,8 +5,8 @@ Serving code for **Chon** typed-decision models:
 | Model | Base model | GPU memory (bf16) | Notes |
 |---|---|---|---|
 | [Chon-1.0-12B](https://huggingface.co/ninhnv/chon-1.0-12b) | `google/gemma-4-12B-it` | about 40 GB | most accurate |
-| [Chon-1.0-E4B](https://huggingface.co/ninhnv/chon-1.0-e4b) | `google/gemma-4-E4B-it` | 24 GB or more | smaller; also runs on CPU |
-| [Chon-1.0-E2B](https://huggingface.co/ninhnv/chon-1.0-e2b) | `google/gemma-4-E2B-it` | 16 GB or more | smallest and fastest; also runs on CPU |
+| [Chon-1.0-E4B](https://huggingface.co/ninhnv/chon-1.0-e4b) | `google/gemma-4-E4B-it` | 24 GB or more | smaller; Macs with 24 GB or more |
+| [Chon-1.0-E2B](https://huggingface.co/ninhnv/chon-1.0-e2b) | `google/gemma-4-E2B-it` | 16 GB or more | smallest and fastest; about 1 s per decision on an 18 GB MacBook Pro |
 
 Given a state (text, JSON or a conversation) and one question with a closed set of options, a Chon model
 returns a calibrated probability for every option:
@@ -51,17 +51,20 @@ Options:
 - `--no-think`: always answer in a single forward pass, even for a model whose `chon_config.json` turns on
   a short extra pass for unsure questions.
 
-### On CPU
+### On a Mac or CPU
 
-The E4B and E2B models also run without a GPU:
+The E4B and E2B models also run without a data-centre GPU. On a Mac with Apple silicon, use its GPU with
+`--device mps`; elsewhere `--device cpu`:
 
 ```bash
+python -m chon.serve --model ninhnv/chon-1.0-e2b --device mps --port 8000
+python -m chon.serve --model ninhnv/chon-1.0-e4b --device mps --no-think --port 8000   # 24 GB or more
 python -m chon.serve --model ninhnv/chon-1.0-e2b --device cpu --port 8000
-python -m chon.serve --model ninhnv/chon-1.0-e4b --device cpu --no-think --port 8000
 ```
 
-Use `--no-think` for Chon-1.0-E4B on CPU: its extra pass for unsure questions generates text, which is
-slow without a GPU. Each model card reports CPU response times.
+Chon-1.0-E2B answers in about 1 s on an 18 GB MacBook Pro (M3 Pro) with `--device mps`; on its CPU alone it
+is several times slower. Use `--no-think` for Chon-1.0-E4B outside a data-centre GPU: its extra pass for
+unsure questions generates text, which is slow there. Each model card reports measured response times.
 
 ## Request and response
 
