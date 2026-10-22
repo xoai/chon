@@ -23,7 +23,7 @@ from __future__ import annotations
 import json
 from typing import Any, Sequence
 
-from .schema import MAX_OPTIONS, options_for
+from .schema import MAX_OPTIONS, instructions_text, options_for
 
 PROMPT_VERSION = 1
 LETTERS = "ABCDEFGHIJKLMNOP"[:MAX_OPTIONS]
@@ -64,7 +64,7 @@ def state_text(state: Any) -> str:
 
 def question_text(question: dict, order: Sequence[str]) -> str:
     opts = dict(options_for(question))
-    lines = [f"Question: {question['instructions'].strip()}"]
+    lines = [f"Question: {instructions_text(question)}"]
     for letter, label in zip(LETTERS, order):
         desc = opts[label]
         lines.append(f"{letter}) {label} — {desc}" if desc else f"{letter}) {label}")

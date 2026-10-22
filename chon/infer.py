@@ -24,7 +24,7 @@ from .modeling import (letter_logits, left_pad, load_causal_lm, load_tokenizer, 
 import contextlib
 
 from .prompt import INLINE_PREFIX, INLINE_SUFFIX, PromptBuilder, suffix_letter_ids
-from .schema import ItemError, options_for, validate_item
+from .schema import MAX_OPTIONS, CapacityError, ItemError, options_for, validate_item
 
 
 def log_softmax(xs: Sequence[float]) -> list[float]:
@@ -77,6 +77,14 @@ def resolve_package(path: str) -> str:
     if not read_model_config(probe).get("base_model"):
         return path  # a plain model id: transformers loads it as usual
     return snapshot_download(repo, revision=rev or None)
+
+
+def _subquestion(question: dict, opts: list[tuple[str, str | None]]) -> dict:
+    """The same choice restricted to some of its options (criteria kept as given: dict or list)."""
+    crit = question["criteria"]
+    keep = [lab for lab, _ in opts]
+    sub = {k: crit[k] for k in keep} if isinstance(crit, dict) else keep
+    return {**question, "criteria": sub}
 
 
 class DecisionModel:
@@ -167,7 +175,19 @@ class DecisionModel:
             raise ValueError(f"unknown quantization {quantize!r}")
         if compile:
             model.forward = torch.compile(model.forward, dynamic=True)
-        return cls(model, tok, cfg, device=device, max_batch_tokens=max_batch_tokens)
+        dm = cls(model, tok, cfg, device=device, max_batch_tokens=max_batch_tokens)
+        if dm.think and dm.think.get("engine") in ("vllm", "hf-static") and not str(device).startswith("cuda"):
+            dm.think["engine"] = "hf"  # CPU: plain generate (vLLM and the compiled static cache are GPU paths)
+        elif dm.think and dm.think.get("engine") == "vllm" and not dm.think.get("vllm_url"):
+            from .vllm_sidecar import ensure
+
+            url = ensure(path, dm.think.get("vllm"))  # after our model: vLLM gets what memory is left
+            if url:
+                dm.think["vllm_url"] = url
+            else:
+                dm.think["engine"] = dm.think.get("fallback_engine", "hf-static")
+                print(f"[think] vLLM unavailable: reasoning with engine {dm.think['engine']!r}")
+        return dm
 
     # ------------------------------------------------------------------ core
     def encode(self, state: Any, question: dict, order: Sequence[str] | None = None,
@@ -203,27 +223,73 @@ class DecisionModel:
             return max(py, 1 - py) < tau["noul"]
         return max(probs) < tau[qtype]
 
-    @torch.inference_mode()
-    def _generate(self, prompts: list[list[int]], max_new: int) -> list[list[int]]:
-        """Greedy continuations (stop tokens dropped), longest first, batches capped by prompt+new tokens."""
-        ctx = generation_context(self.model, self.think["generator"])
-        pad = self.tok.pad_token_id
+    def _stop_ids(self) -> set[int]:
         eos = self.tok.eos_token_id
         stop = set(eos if isinstance(eos, list) else [eos])
         if "<end_of_turn>" in self.tok.get_vocab():
             stop.add(self.tok.convert_tokens_to_ids("<end_of_turn>"))
+        return stop
+
+    def _generate_vllm(self, prompts: list[list[int]], max_new: int) -> list[list[int]]:
+        """The reasoning written by a vLLM server running the plain base model (think "engine": "vllm"; only
+        for generator "base", whose reasoning comes from the base weights anyway). Same greedy decoding from the
+        same token ids; the letters are still read by this model. Server: think["vllm_url"] or $CHON_VLLM_URL
+        (default http://127.0.0.1:8100). Requests go out in parallel, so the server batches them."""
+        import json as _json
+        import urllib.request
+        from concurrent.futures import ThreadPoolExecutor
+
+        if self.think.get("generator", "base") != "base":
+            raise ValueError('think engine "vllm" writes with the base model: needs generator "base"')
+        url = (self.think.get("vllm_url") or os.environ.get("CHON_VLLM_URL") or "http://127.0.0.1:8100").rstrip("/")
+        if not getattr(self, "_vllm_model", None):
+            with urllib.request.urlopen(url + "/v1/models", timeout=30) as r:
+                self._vllm_model = _json.load(r)["data"][0]["id"]
+        stop = self._stop_ids()
+
+        def one(ids: list[int]) -> list[int]:
+            body = {"model": self._vllm_model, "prompt": ids, "max_tokens": max_new, "temperature": 0.0,
+                    "stop_token_ids": sorted(stop), "skip_special_tokens": False, "logprobs": 1,
+                    "return_tokens_as_token_ids": True}
+            req = urllib.request.Request(url + "/v1/completions", data=_json.dumps(body).encode(),
+                                         headers={"Content-Type": "application/json"})
+            with urllib.request.urlopen(req, timeout=900) as r:
+                ch = _json.load(r)["choices"][0]
+            toks = (ch.get("logprobs") or {}).get("tokens") or []
+            out = [int(t.split(":", 1)[1]) for t in toks if isinstance(t, str) and t.startswith("token_id:")]
+            if not out and ch.get("text"):  # an older server: re-tokenise the text
+                out = self.tok(ch["text"], add_special_tokens=False)["input_ids"]
+            return [t for t in out if t not in stop]
+
+        if len(prompts) == 1:
+            return [one(prompts[0])]
+        with ThreadPoolExecutor(max_workers=min(int(self.think.get("max_batch", 32)), len(prompts))) as ex:
+            return list(ex.map(one, prompts))
+
+    @torch.inference_mode()
+    def _generate(self, prompts: list[list[int]], max_new: int) -> list[list[int]]:
+        """Greedy continuations (stop tokens dropped), longest first, batches capped by prompt+new tokens.
+        think "engine": "hf" (default), "hf-static" (static KV cache, which transformers compiles), "vllm"."""
+        engine = self.think.get("engine", "hf")
+        if engine == "vllm":
+            return self._generate_vllm(prompts, max_new)
+        extra = {"cache_implementation": "static"} if engine == "hf-static" else {}
+        ctx = generation_context(self.model, self.think["generator"])
+        pad = self.tok.pad_token_id
+        stop = self._stop_ids()
         budget = int(self.think.get("batch_tokens", 48000))
         order = sorted(range(len(prompts)), key=lambda i: -len(prompts[i]))
         out: list[list[int]] = [[] for _ in prompts]
         i = 0
-        while i < len(order):
-            n = max(1, min(int(self.think.get("max_batch", 32)), budget // (len(prompts[order[i]]) + max_new)))
+        cap = int(self.think.get("static_max_batch", 1)) if engine == "hf-static" else int(self.think.get("max_batch", 32))
+        while i < len(order):  # a static cache is reserved at full length per sequence: one at a time by default
+            n = max(1, min(cap, budget // (len(prompts[order[i]]) + max_new)))
             idx = order[i:i + n]
             ids, mask = left_pad([prompts[j] for j in idx], pad)
             with ctx():
                 gen = self.model.generate(input_ids=ids.to(self.device), attention_mask=mask.to(self.device),
                                           max_new_tokens=max_new, do_sample=False, use_cache=True,
-                                          pad_token_id=pad, eos_token_id=sorted(stop))
+                                          pad_token_id=pad, eos_token_id=sorted(stop), **extra)
             for j, row in zip(idx, gen[:, ids.shape[1]:].tolist()):
                 toks = []
                 for t in row:
@@ -314,32 +380,93 @@ class DecisionModel:
 
     # ------------------------------------------------------------------ API shape
     def predict(self, state: Any, questions: dict[str, dict]) -> tuple[dict, dict]:
-        """TypeSafe /v1/systemone semantics. Returns (answers, usage)."""
+        """TypeSafe /v1/systemone semantics. Returns (answers, usage).
+        A choice with more than MAX_OPTIONS options (up to MAX_OPTIONS ** 2) is read in groups, then a final round
+        between the group winners (_predict_many). cfg "truncate": false refuses a state over max_state_tokens with
+        a CapacityError instead of cutting it."""
         if not isinstance(questions, dict) or not questions:
             raise ItemError("questions must be a non-empty object")
         names = list(questions)
-        for n in names:
-            validate_item({"id": n, "state": state, "question": questions[n]}, require_expected=False)
-        fitted = self.builder.fit_state(state)[0]
-        seqs, orders = [], []
+        many: dict[str, dict] = {}
         for n in names:
             q = questions[n]
-            order = [lab for lab, _ in options_for(q)]
-            seqs.append(self.encode(state, q, order, fitted_state=fitted))
-            orders.append(order)
+            big = (isinstance(q, dict) and q.get("type") == "choice" and isinstance(q.get("criteria"), (dict, list))
+                   and len(q["criteria"]) > MAX_OPTIONS and self.cfg.get("many_options", True))
+            validate_item({"id": n, "state": state, "question": q}, require_expected=False, allow_empty_state=True,
+                          max_options=MAX_OPTIONS ** 2 if big else None)
+            if big:
+                many[n] = q
+        if state is None:
+            state = ""
+        fitted, truncated = self.builder.fit_state(state)
+        if truncated and not self.cfg.get("truncate", True):
+            raise CapacityError(f"the state is longer than {self.builder.max_state_tokens} tokens: maximum context "
+                                f"length exceeded (this model does not truncate)")
+        normal = [n for n in names if n not in many]
+        answers: dict[str, dict] = {}
+        usage = {"input_tokens": 0, "output_tokens": 0, "forward_s": 0.0}
         t0 = time.perf_counter()
-        logits = self.raw_logits(seqs, [len(o) for o in orders])
-        qtypes = [questions[n]["type"] for n in names]
-        probs = [softmax(lg, self.temperatures.get(qt, 1.0)) for lg, qt in zip(logits, qtypes)]
-        thought = self._apply_think(qtypes, orders, seqs, logits, probs)
-        self._commit(qtypes, orders, probs)
-        elapsed = time.perf_counter() - t0
-        answers = {n: format_answer(questions[n], dict(zip(order, p))) for n, order, p in zip(names, orders, probs)}
-        n_thought = sum(1 for t in thought if t is not None)
-        out_tokens = sum(t for t in thought if t is not None)
-        extra_in = n_thought * (len(self._prefix) + len(self._suffix)) if self.think else 0
-        usage = {"input_tokens": sum(len(s) for s in seqs) + extra_in, "output_tokens": out_tokens,
-                 "forward_s": round(elapsed, 4)}
-        if self.think:
-            usage["thought"] = n_thought
-        return answers, usage
+        if normal:
+            seqs, orders = [], []
+            for n in normal:
+                q = questions[n]
+                order = [lab for lab, _ in options_for(q)]
+                seqs.append(self.encode(state, q, order, fitted_state=fitted))
+                orders.append(order)
+            logits = self.raw_logits(seqs, [len(o) for o in orders])
+            qtypes = [questions[n]["type"] for n in normal]
+            probs = [softmax(lg, self.temperatures.get(qt, 1.0)) for lg, qt in zip(logits, qtypes)]
+            thought = self._apply_think(qtypes, orders, seqs, logits, probs)
+            self._commit(qtypes, orders, probs)
+            for n, order, p in zip(normal, orders, probs):
+                answers[n] = format_answer(questions[n], dict(zip(order, p)))
+            n_thought = sum(1 for t in thought if t is not None)
+            extra_in = n_thought * (len(self._prefix) + len(self._suffix)) if self.think else 0
+            usage["input_tokens"] += sum(len(s) for s in seqs) + extra_in
+            usage["output_tokens"] += sum(t for t in thought if t is not None)
+            if self.think:
+                usage["thought"] = n_thought
+        else:
+            self.think_tokens = []
+        if many:
+            more, n_in = self._predict_many(state, many, fitted)
+            answers.update(more)
+            usage["input_tokens"] += n_in
+        usage["forward_s"] = round(time.perf_counter() - t0, 4)
+        return {n: answers[n] for n in names}, usage
+
+    def _predict_many(self, state: Any, qs: dict[str, dict], fitted: str) -> tuple[dict, int]:
+        """Choices with more than MAX_OPTIONS options: each group of at most MAX_OPTIONS options is read as its own
+        question, then one final question between the group winners. P(option) = P(its group wins the final) x
+        P(option | its group), so every option gets a probability and they sum to 1. No thinking on these."""
+        t = self.temperatures.get("choice", 1.0)
+        plan, seqs, owner = [], [], []
+        for n, q in qs.items():
+            opts = options_for(q)
+            k = math.ceil(len(opts) / MAX_OPTIONS)
+            size = math.ceil(len(opts) / k)
+            groups = [opts[i:i + size] for i in range(0, len(opts), size)]
+            plan.append((n, q, groups))
+            for gi, grp in enumerate(groups):
+                seqs.append(self.encode(state, _subquestion(q, grp), [lab for lab, _ in grp], fitted_state=fitted))
+                owner.append((n, gi, len(grp)))
+        lg1 = self.raw_logits(seqs, [m for _, _, m in owner])
+        p1 = {(n, gi): softmax(lg, t) for (n, gi, _), lg in zip(owner, lg1)}
+        seqs2, finals = [], []
+        for n, q, groups in plan:
+            winners = [grp[max(range(len(grp)), key=p1[(n, gi)].__getitem__)] for gi, grp in enumerate(groups)]
+            finals.append(len(winners))
+            seqs2.append(self.encode(state, _subquestion(q, winners), [lab for lab, _ in winners], fitted_state=fitted))
+        lg2 = self.raw_logits(seqs2, finals)
+        out = {}
+        for (n, q, groups), lg in zip(plan, lg2):
+            pg = softmax(lg, t)
+            probs = {}
+            for gi, grp in enumerate(groups):
+                for (lab, _), pi in zip(grp, p1[(n, gi)]):
+                    probs[lab] = pg[gi] * pi
+            labels = [lab for lab, _ in options_for(q)]
+            plist = [probs[lab] for lab in labels]
+            self._commit(["choice"], [labels], [plist])
+            out[n] = format_answer(q, dict(zip(labels, plist)))
+        return out, sum(len(s) for s in seqs) + sum(len(s) for s in seqs2)

@@ -21,7 +21,7 @@ def create_app(model, api_key: str | None = None):
     from fastapi import FastAPI, Header, HTTPException, Request
     from fastapi.responses import JSONResponse
 
-    from .schema import ItemError
+    from .schema import CapacityError, ItemError
 
     app = FastAPI(title="chon decision server")
     lock = threading.Lock()
@@ -57,6 +57,8 @@ def create_app(model, api_key: str | None = None):
             import anyio
 
             answers, usage = await anyio.to_thread.run_sync(work)
+        except CapacityError as e:  # too long to take whole: 413 with the standard "maximum context length" marker
+            return JSONResponse({"error": str(e)}, status_code=413)
         except ItemError as e:
             return JSONResponse({"error": str(e)}, status_code=400)
         usage["latency_s"] = round(time.perf_counter() - t0, 4)
@@ -76,6 +78,8 @@ def main(argv=None) -> None:
     ap.add_argument("--think", default=None,
                     help="override the think-when-unsure settings (JSON file); default: the model's chon_config.json")
     ap.add_argument("--no-think", action="store_true", help="ignore a think config in the model's chon_config")
+    ap.add_argument("--think-set", action="append", default=[], metavar="KEY=VALUE",
+                    help="override one think setting, e.g. engine=hf to skip vLLM (repeatable)")
     ap.add_argument("--host", default="0.0.0.0")
     ap.add_argument("--port", type=int, default=8000)
     args = ap.parse_args(argv)
@@ -87,6 +91,10 @@ def main(argv=None) -> None:
     think = False if args.no_think else (json.load(open(args.think)) if args.think else None)
     model = DecisionModel.load(args.model, adapter=args.adapter, device=args.device, dtype=args.dtype,
                                quantize=args.quantize, compile=args.compile, think=think)
+    for kv in args.think_set:
+        k, _, v = kv.partition("=")
+        if model.think is not None:
+            model.think[k] = json.loads(v) if v[:1] in "[{0123456789" or v in ("true", "false", "null") else v
     # warm-up so the first measured request is not a cold start
     model.predict("warm-up", {"w": {"type": "noul", "instructions": "Is this a warm-up?"}})
     uvicorn.run(create_app(model, os.environ.get("CHON_API_KEY")), host=args.host, port=args.port,

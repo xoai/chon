@@ -26,6 +26,11 @@ class ItemError(ValueError):
     pass
 
 
+class CapacityError(ItemError):
+    """A request the model cannot take whole (no truncation allowed): the message carries the standard capacity
+    marker ("maximum context length") that benchmark runners map to "unsupported"."""
+
+
 def options_for(question: dict) -> list[tuple[str, str | None]]:
     """Return the options of a question as (label, description) in natural order.
 
@@ -63,8 +68,15 @@ def options_for(question: dict) -> list[tuple[str, str | None]]:
 def _desc(v: Any) -> str | None:
     if v is None:
         return None
-    s = str(v).strip()
+    s = (v if isinstance(v, str) else json.dumps(v, ensure_ascii=False, separators=(",", ":"))).strip()
     return s or None
+
+
+def instructions_text(q: dict) -> str:
+    """Instructions may be a string or a JSON object (rendered compactly)."""
+    v = q.get("instructions")
+    return (v if isinstance(v, str) else json.dumps(v, ensure_ascii=False, separators=(",", ":"))).strip() \
+        if v is not None else ""
 
 
 def _check_unique(labels: list[str]) -> None:
@@ -86,7 +98,8 @@ def normalize_expected(item: dict) -> str:
     return str(exp)
 
 
-def validate_item(item: dict, require_expected: bool = True) -> dict:
+def validate_item(item: dict, require_expected: bool = True, allow_empty_state: bool = False,
+                  max_options: int | None = None) -> dict:
     """Validate and normalise an item in place-safe fashion; returns a cleaned copy.
 
     Raises ItemError with a human-readable reason.
@@ -97,7 +110,9 @@ def validate_item(item: dict, require_expected: bool = True) -> dict:
     if not it.get("id"):
         raise ItemError("missing id")
     state = it.get("state")
-    if state is None or (isinstance(state, (str, list, dict)) and len(state) == 0):
+    if allow_empty_state and (state is None or (isinstance(state, (str, list, dict)) and len(state) == 0)):
+        state = it["state"] = ""
+    elif state is None or (isinstance(state, (str, list, dict)) and len(state) == 0):
         raise ItemError("empty state")
     if not isinstance(state, (str, list, dict)):
         raise ItemError("state must be a string, object or list")
@@ -106,11 +121,12 @@ def validate_item(item: dict, require_expected: bool = True) -> dict:
         raise ItemError("missing question")
     if q.get("type") not in QTYPES:
         raise ItemError(f"bad question type {q.get('type')!r}")
-    if not str(q.get("instructions") or "").strip():
+    if not instructions_text(q):
         raise ItemError("missing instructions")
     opts = options_for(q)
-    if not (2 <= len(opts) <= MAX_OPTIONS):
-        raise ItemError(f"need 2..{MAX_OPTIONS} options, got {len(opts)}")
+    cap = MAX_OPTIONS if max_options is None else max_options
+    if not (2 <= len(opts) <= cap):
+        raise ItemError(f"need 2..{cap} options, got {len(opts)}")
     labels = [lab for lab, _ in opts]
     if it.get("labels") is not None and set(map(str, it["labels"])) != set(labels):
         raise ItemError("labels do not match the criteria")

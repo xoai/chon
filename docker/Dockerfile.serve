@@ -1,0 +1,36 @@
+# Chon decision-model server (TypeSafe /v1/systemone, as JevBench calls it).
+#
+# Two Python environments, as tested on our pods:
+#   /opt/venv       chon.serve: torch 2.9.1 (CUDA 12.8 build), transformers 5.20, peft 0.18 - reads every answer
+#   /opt/vllm-env   vLLM 0.32.0 with its own torch (CUDA 13.2 build) - writes the "think when unsure" reasoning
+# chon.serve starts vLLM itself (FP8 weights of the base model, with the GPU memory left after loading the model)
+# when the package's think settings say engine "vllm"; if vLLM cannot start (driver too old for CUDA 13.2, too little
+# free GPU memory) it falls back to a static KV cache in /opt/venv, and the answers stay the same model's.
+#
+#   docker build -f docker/Dockerfile.serve -t chon-serve .
+#   docker run --gpus '"device=0"' -e HF_TOKEN -p 127.0.0.1:8000:8000 chon-serve
+#   (default model: ninhnv/chon-1.0-12b; pass --model <repo or /model> to serve another package)
+FROM python:3.12-slim
+ENV PYTHONUNBUFFERED=1 PIP_NO_CACHE_DIR=1 TOKENIZERS_PARALLELISM=false HF_HOME=/hf \
+    CHON_VLLM_BIN=/opt/vllm-env/bin/vllm PATH=/opt/venv/bin:$PATH
+# a C compiler (Triton builds a small helper at the first forward pass) and curl (health checks)
+RUN apt-get update && apt-get install -y --no-install-recommends gcc g++ libc6-dev curl \
+    && rm -rf /var/lib/apt/lists/*
+WORKDIR /app
+
+# vLLM first: the larger, slower layer, unchanged when the chon code changes
+RUN python -m venv /opt/vllm-env && /opt/vllm-env/bin/pip install uv \
+    && /opt/vllm-env/bin/uv pip install --python /opt/vllm-env/bin/python "vllm==0.32.0" --torch-backend=cu132 \
+    && FIV=$(/opt/vllm-env/bin/python -c "import flashinfer; print(flashinfer.__version__)") \
+    && (/opt/vllm-env/bin/uv pip install --python /opt/vllm-env/bin/python "flashinfer-cubin==$FIV" \
+        || echo "flashinfer-cubin not installed: vLLM uses its other kernels")
+
+COPY pyproject.toml README.md ./
+COPY chon ./chon
+RUN python -m venv /opt/venv \
+    && pip install "torch==2.9.1" --index-url https://download.pytorch.org/whl/cu128 \
+    && pip install ".[serve]" "transformers==5.20.2" "peft==0.18.1" "torchao==0.14.1" "huggingface_hub[hf_xet]>=1.0"
+
+EXPOSE 8000
+ENTRYPOINT ["python", "-m", "chon.serve"]
+CMD ["--model", "ninhnv/chon-1.0-12b", "--host", "0.0.0.0", "--port", "8000"]
