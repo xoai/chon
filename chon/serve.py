@@ -71,7 +71,7 @@ def main(argv=None) -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--model", required=True)
     ap.add_argument("--adapter", default=None)
-    ap.add_argument("--device", default="cuda")
+    ap.add_argument("--device", default="auto", help="auto (NVIDIA GPU, else Apple GPU, else CPU), cuda, mps or cpu")
     ap.add_argument("--dtype", default="bfloat16")
     ap.add_argument("--quantize", default=None, choices=[None, "fp8"])
     ap.add_argument("--compile", action="store_true", help="torch.compile the forward (warm-up takes minutes)")
@@ -95,6 +95,8 @@ def main(argv=None) -> None:
         k, _, v = kv.partition("=")
         if model.think is not None:
             model.think[k] = json.loads(v) if v[:1] in "[{0123456789" or v in ("true", "false", "null") else v
+    print(f"[serve] {model.name} on {model.device}"
+          + (f", reasoning engine {model.think.get('engine', 'hf')}" if model.think else ", no reasoning"), flush=True)
     # warm-up so the first measured request is not a cold start
     model.predict("warm-up", {"w": {"type": "noul", "instructions": "Is this a warm-up?"}})
     uvicorn.run(create_app(model, os.environ.get("CHON_API_KEY")), host=args.host, port=args.port,

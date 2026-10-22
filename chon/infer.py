@@ -87,6 +87,18 @@ def _subquestion(question: dict, opts: list[tuple[str, str | None]]) -> dict:
     return {**question, "criteria": sub}
 
 
+def resolve_device(device: str | None) -> str:
+    """"auto" (or None): an NVIDIA GPU if there is one, else Apple's GPU (mps), else the CPU."""
+    if device not in (None, "", "auto"):
+        return str(device)
+    if torch.cuda.is_available():
+        return "cuda"
+    mps = getattr(torch.backends, "mps", None)
+    if mps is not None and mps.is_available():
+        return "mps"
+    return "cpu"
+
+
 class DecisionModel:
     def __init__(self, model, tokenizer, cfg: dict | None = None, device: str | torch.device = "cpu",
                  max_batch_tokens: int = 32768, name: str = "chon"):
@@ -139,6 +151,7 @@ class DecisionModel:
              merge: bool | None = None) -> "DecisionModel":
         """think: a think config (dict), False to switch it off, None to use the model's config.
         merge: merge the adapter into the weights (default: yes, unless thinking needs the base model)."""
+        device = resolve_device(device)
         path = resolve_package(path)
         own = read_model_config(path)
         if adapter is None and own.get("base_model") and os.path.exists(os.path.join(path, "adapter_config.json")):

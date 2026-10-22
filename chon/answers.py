@@ -12,7 +12,8 @@ def format_answer(question: dict, probs: dict[str, float]) -> dict:
     total = sum(probs[lab] for lab in labels)
     p = {lab: probs[lab] / total for lab in labels}
     if qtype == "noul":
-        return {"type": "noul", "noul": p["yes"]}
+        # probabilities keyed like the criteria (true / false), as other /v1/systemone servers return them
+        return {"type": "noul", "noul": p["yes"], "probabilities": {"true": p["yes"], "false": p["no"]}}
     if qtype == "choice":
         best = max(labels, key=lambda lab: p[lab])
         return {"type": "choice", "choice": best, "confidence": p[best], "probabilities": p}

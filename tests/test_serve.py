@@ -67,3 +67,13 @@ def test_request_forms():
     it = validate_item({"id": "x", "state": "", "question": q}, require_expected=False, allow_empty_state=True,
                        max_options=256)
     assert it["state"] == "" and len(it["labels"]) == 40
+
+
+def test_noul_probabilities_and_hidden_keys():
+    from chon.answers import format_answer
+    from chon.prompt import question_text
+
+    a = format_answer({"type": "noul", "instructions": "x"}, {"yes": 0.25, "no": 0.75})
+    assert a["noul"] == 0.25 and a["probabilities"] == {"true": 0.25, "false": 0.75}
+    q = {"type": "choice", "instructions": "Which?", "criteria": {"0": "refund", "1": "replace"}, "option_keys": "hide"}
+    assert "A) refund" in question_text(q, ["0", "1"]) and "0 —" not in question_text(q, ["0", "1"])

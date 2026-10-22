@@ -94,6 +94,8 @@ and the server falls back to the static cache.
 
 ### On a Mac or CPU
 
+`--device` defaults to `auto`: an NVIDIA GPU if there is one, else Apple's GPU, else the CPU.
+
 The E4B and E2B models also run without a data-centre GPU. On a Mac with Apple silicon, use its GPU with
 `--device mps`; elsewhere `--device cpu`:
 
@@ -124,8 +126,11 @@ curl -s localhost:8000/v1/systemone -H 'Content-Type: application/json' -d '{
 
 Each entry under `answers` has a `type` and:
 - **choice:** `choice` and `probabilities` over the option labels
-- **yes/no:** `noul` = P(yes)
+- **yes/no:** `noul` = P(yes), and the same as `probabilities` keyed `true` / `false`
 - **score:** `score` and `probabilities` over the levels
+
+When option labels are only ids ("0", "1", ...), send `"option_keys": "hide"` in the question and the model
+sees only the descriptions.
 
 `usage` reports `input_tokens` and `output_tokens`. Most decisions are a single forward pass with no
 output tokens; some take a short extra pass whose generated tokens are counted in `output_tokens`.

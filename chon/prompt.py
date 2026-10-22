@@ -65,9 +65,13 @@ def state_text(state: Any) -> str:
 def question_text(question: dict, order: Sequence[str]) -> str:
     opts = dict(options_for(question))
     lines = [f"Question: {instructions_text(question)}"]
+    hide = question.get("option_keys") == "hide"  # keys are ids (e.g. "0", "1"): show only the descriptions
     for letter, label in zip(LETTERS, order):
         desc = opts[label]
-        lines.append(f"{letter}) {label} — {desc}" if desc else f"{letter}) {label}")
+        if desc and hide:
+            lines.append(f"{letter}) {desc}")
+        else:
+            lines.append(f"{letter}) {label} — {desc}" if desc else f"{letter}) {label}")
     lines.append("Answer with one letter.")
     return "\n".join(lines)
 
