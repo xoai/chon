@@ -9,9 +9,12 @@ Optional bearer auth: set CHON_API_KEY. Requests are served one at a time on the
 benchmarks measure serial latency; a lock keeps measurements clean).
 
 Deadline (--deadline, default 8 s; $CHON_DEADLINE_S; 0 switches it off): counted from the request's arrival,
-waiting for the GPU included. The one-pass answer is always computed and kept; the reasoning of an unsure answer
-runs only with the time left, shortened or skipped to fit, and dropped if the clock runs out, so a reply never
-waits past a client's time limit for a better answer.
+waiting for the GPU included. The one-pass answer is always computed and kept; a second read of an unsure answer
+(--reread / $CHON_REREAD / the model's "reread") is skipped when too little time is left, and the reasoning of an
+unsure answer runs only with the time left, shortened or skipped to fit, and dropped if the clock runs out, so a
+reply never waits past a client's time limit for a better answer.
+
+The prompt layout ("prompt_layout": state_first, header or hybrid_header) comes from the model's chon_config.json.
 """
 
 
@@ -38,7 +41,9 @@ def create_app(model, api_key: str | None = None, deadline_s: float = 0.0):
     @app.get("/health")
     def health():
         return {"ok": True, "model": model.name, "deadline_s": deadline_s or None,
-                "deadline": dict(getattr(model, "deadline_stats", {}) or {})}
+                "deadline": dict(getattr(model, "deadline_stats", {}) or {}),
+                "prompt_layout": getattr(model, "layout", None), "reread": getattr(model, "reread", None),
+                "reread_stats": dict(getattr(model, "reread_stats", {}) or {})}
 
     @app.get("/v1/models")
     def models():
@@ -92,6 +97,9 @@ def main(argv=None) -> None:
     ap.add_argument("--deadline", type=float, default=float(os.environ.get("CHON_DEADLINE_S", "8")),
                     help="seconds from a request's arrival to its answer: the reasoning is shortened or skipped to "
                          "fit, the one-pass answer always stands (0 = no deadline; default 8, $CHON_DEADLINE_S)")
+    ap.add_argument("--reread", default=None, metavar="BELOW[,LAYOUT[,MAX_TOKENS[,COMBINE]]]",
+                    help="second read of unsure answers, e.g. 0.9 or 0.9,twice,2000,avg; off switches off the "
+                         "model's own setting (default: $CHON_REREAD, else the model's chon_config.json)")
     ap.add_argument("--host", default="0.0.0.0")
     ap.add_argument("--port", type=int, default=8000)
     args = ap.parse_args(argv)
@@ -100,6 +108,8 @@ def main(argv=None) -> None:
 
     from .infer import DecisionModel
 
+    if args.reread is not None:
+        os.environ["CHON_REREAD"] = args.reread   # read by DecisionModel (chon.infer.parse_reread)
     think = False if args.no_think else (json.load(open(args.think)) if args.think else None)
     model = DecisionModel.load(args.model, adapter=args.adapter, device=args.device, dtype=args.dtype,
                                quantize=args.quantize, compile=args.compile, think=think)
@@ -107,8 +117,11 @@ def main(argv=None) -> None:
         k, _, v = kv.partition("=")
         if model.think is not None:
             model.think[k] = json.loads(v) if v[:1] in "[{0123456789" or v in ("true", "false", "null") else v
-    print(f"[serve] {model.name} on {model.device}"
-          + (f", reasoning engine {model.think.get('engine', 'hf')}" if model.think else ", no reasoning"), flush=True)
+    print(f"[serve] {model.name} on {model.device}, prompt layout {model.layout}"
+          + (f", reasoning engine {model.think.get('engine', 'hf')}" if model.think else ", no reasoning")
+          + (f", second read below {model.reread['below']:g} ({model.reread['layout']}, {model.reread['combine']}, "
+             f"prompts up to {model.reread['max_tokens']} tokens)" if model.reread else ", no second read"),
+          flush=True)
     # warm-up so the first measured request is not a cold start; the reasoning path too (its first call compiles,
     # and its speed sets how many tokens a deadline allows)
     model.predict("warm-up", {"w": {"type": "noul", "instructions": "Is this a warm-up?"}})

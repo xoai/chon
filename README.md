@@ -59,6 +59,61 @@ Options:
   computed first and kept; the extra pass for an unsure question runs only with the time left (shortened, or
   skipped when too little remains) and is dropped if the clock runs out, so a client with a time limit never
   waits past it for a better answer. `/health` reports how often the extra pass was shortened, skipped or cut.
+- `--reread BELOW[,LAYOUT[,MAX_TOKENS[,COMBINE]]]` (`CHON_REREAD`): a second read of unsure answers, e.g.
+  `--reread 0.9` or `--reread 0.9,twice,2000,replace`; `--reread off` turns off a model's own setting. See
+  [Prompt layout and second read](#prompt-layout-and-second-read).
+
+### Prompt layout and second read
+
+Since 1.3.0 the server reads two settings from a model's `chon_config.json`. **Version 1.2.0 and older ignore
+both** (they read every model state-first, in one read), so serve a model that sets them with 1.3.0 or newer.
+
+**`prompt_layout`** is the prompt layout the model was trained with:
+
+- `"state_first"` (the default): the state, then `---`, then the question and its lettered options.
+- `"header"`: the request's questions listed first, then the state, then the question being read:
+
+  ```
+  Questions that will be asked about this record:
+  - <instructions of question 1>
+  - <instructions of question 2>
+  ---
+  <state>
+
+  ---
+  Question: <instructions of the question being read>
+  A) ...
+  Answer with one letter.
+  ```
+
+  The list holds each distinct `instructions` of the request once, in request order (two questions with the same
+  instructions and different options are listed once), with runs of whitespace collapsed to one space; every read
+  of the request lists the same questions, including the group and final rounds of a choice with more than 16
+  options.
+- `"hybrid_header"`: the header for a request with two or more distinct questions, state-first for a request with
+  one (counted by distinct instructions).
+
+Any other value is refused when the model loads, rather than read in the wrong layout.
+
+**`reread`** turns on a second read of unsure answers: a choice or yes/no question whose top calibrated probability
+is under `below`, in a prompt of at most `max_tokens` tokens, is read once more and its two distributions are
+combined. Choices with more than 16 options and score questions are read once.
+
+```json
+"reread": {"below": 0.9, "layout": "twice", "max_tokens": 2000, "combine": "avg"}
+```
+
+- `layout`: `"twice"` writes the whole request out twice (`... Read the request again: ...`) and reads the letter
+  after the second copy; a header read is written out twice with its question list. `"sandwich"` is the question,
+  the state, then the question again.
+- `combine`: `"avg"` averages the two distributions; `"replace"` keeps the second read.
+- `CHON_REREAD` (or `--reread`) overrides the config: `below[,layout[,max_tokens[,combine]]]`, an empty field keeps
+  its value (`0.9,twice,,replace`), and `0` or `off` turns the second read off.
+- The second read is skipped when the request's deadline (`--deadline`) leaves too little time for it; the first
+  read's answer stands. Its prompt tokens are counted in `usage.input_tokens`, and `usage.reread` says how many
+  questions were read twice. `/health` reports the layout, the setting and counts.
+- The letters are always read by the loaded model (transformers), so the second read works with every
+  reasoning engine, vLLM included.
 
 ### Faster reasoning (vLLM)
 
@@ -162,13 +217,18 @@ python -m decision_index pipeline --engine chon.dindex:ChonEngine --option model
 
 The engine answers in one forward pass per question (that board's latency rule), refuses a state longer
 than 32,768 tokens as unsupported instead of truncating it, and reads choices with more than 16 options in
-groups. `python -m chon.dindex shard` / `merge` split the suite so several runner processes can share GPUs.
+groups. The model's prompt layout and second-read setting (above) apply, and the run's provenance states both.
+`python -m chon.dindex shard` / `merge` split the suite so several runner processes can share GPUs.
 
 ## Tests
 
 ```bash
 pip install -e ".[serve,dev]" && pytest
 ```
+
+`tests/test_parity.py` builds a tiny random Gemma 4 model on the CPU and checks that every read's token ids and
+every output probability equal golden values made with the training code (`tests/golden_parity.json`, written by
+`tests/make_golden.py`).
 
 ## Licence
 

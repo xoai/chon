@@ -16,6 +16,20 @@ Prompt layout (user turn of the base model's chat template, thinking disabled):
 
 The state comes first so that several questions about one state share a prefix.
 Keep this scaffold short: every token here is paid for on JevBench's Cost axis.
+
+Other layouts (PromptBuilder.render `layout`; chosen by the model's chon_config.json "prompt_layout"):
+
+    header        Questions that will be asked about this record:
+                  - <instructions of each question of the request, distinct, in request order>
+                  ---
+                  <state>
+
+                  ---
+                  Question: ...            (the question being read, as above)
+
+    twice         the state-first prompt up to the options, "Read the request again:", then the whole
+                  state-first prompt again (a second read of an unsure answer; "twice_header" for a header model)
+    sandwich      the question, the state, the question again (another second-read layout)
 """
 
 from __future__ import annotations
@@ -29,6 +43,15 @@ PROMPT_VERSION = 1
 LETTERS = "ABCDEFGHIJKLMNOP"[:MAX_OPTIONS]
 TRUNC_HEAD = "\n[... truncated]"
 TRUNC_CONV = "[earlier messages omitted]\n"
+ANSWER_LINE = "Answer with one letter."
+REREAD_LINE = "Read the request again:"
+# layouts of the second read of an unsure answer (DecisionModel "reread"): read only when the first read is unsure.
+# "twice": the whole request written out twice (each token of the second copy sees the whole first copy, which a
+# one-way model otherwise never does). "sandwich": the question, the state, the question again.
+REREAD_LAYOUTS = ("twice", "sandwich")
+# "header": every question of the request listed first, then the state, then the question being read, so the state
+# is read knowing everything that will be asked about it. A header model's second read ("twice") is "twice_header".
+HEADER_LINE = "Questions that will be asked about this record:"
 
 
 def _is_message(x: Any) -> bool:
@@ -72,7 +95,7 @@ def question_text(question: dict, order: Sequence[str]) -> str:
             lines.append(f"{letter}) {desc}")
         else:
             lines.append(f"{letter}) {label} — {desc}" if desc else f"{letter}) {label}")
-    lines.append("Answer with one letter.")
+    lines.append(ANSWER_LINE)
     return "\n".join(lines)
 
 
@@ -117,21 +140,39 @@ class PromptBuilder:
         head = ids[: self.max_state_tokens - self._n_tokens(TRUNC_HEAD)]
         return self.tok.decode(head) + TRUNC_HEAD, True
 
-    def render(self, state_txt: str, question: dict, order: Sequence[str]) -> str:
-        content = f"{state_txt}\n\n---\n{question_text(question, order)}"
+    def render(self, state_txt: str, question: dict, order: Sequence[str], layout: str = "state_first",
+               asked: Sequence[str] | None = None) -> str:
+        """layout "state_first" (the state, then the question block: siblings share the state as a prefix), "header"
+        (the request's questions `asked`, each with its whitespace collapsed, then the state, then the question), or
+        a second-read layout: "twice", "sandwich" (REREAD_LAYOUTS) or "twice_header" (a header read, twice)."""
+        q = question_text(question, order)
+        head = q[: -len(ANSWER_LINE)].rstrip("\n")
+        if layout == "state_first":
+            content = f"{state_txt}\n\n---\n{q}"
+        elif layout == "twice":
+            content = f"{state_txt}\n\n---\n{head}\n\n{REREAD_LINE}\n\n{state_txt}\n\n---\n{q}"
+        elif layout == "sandwich":
+            content = f"{head}\n---\n{state_txt}\n\n---\n{q}"
+        elif layout in ("header", "twice_header"):
+            lst = [" ".join(str(a).split()) for a in (asked or [instructions_text(question)])]
+            top = HEADER_LINE + "\n" + "\n".join(f"- {a}" for a in lst) + f"\n---\n{state_txt}\n\n---\n"
+            content = top + q if layout == "header" else f"{top}{head}\n\n{REREAD_LINE}\n\n{top}{q}"
+        else:
+            raise ValueError(f"unknown prompt layout {layout!r}")
         msgs = [{"role": "user", "content": content}]
         text = self.tok.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True,
                                             **self.chat_template_kwargs)
         return text + self.answer_prefix
 
     def encode(self, state: Any, question: dict, order: Sequence[str] | None = None,
-               fitted_state: str | None = None) -> list[int]:
+               fitted_state: str | None = None, layout: str = "state_first",
+               asked: Sequence[str] | None = None) -> list[int]:
         if order is None:
             order = [lab for lab, _ in options_for(question)]
         if len(order) > len(self.letter_ids):
             raise ValueError(f"at most {len(self.letter_ids)} options")
         st = fitted_state if fitted_state is not None else self.fit_state(state)[0]
-        return self.tok(self.render(st, question, order), add_special_tokens=False)["input_ids"]
+        return self.tok(self.render(st, question, order, layout, asked), add_special_tokens=False)["input_ids"]
 
     # ---- letters ------------------------------------------------------------------------------
     def _find_letter_ids(self) -> list[int]:

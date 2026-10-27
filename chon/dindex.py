@@ -12,7 +12,10 @@ time; results are the same rows whichever process answered them).
 Engine settings for the board (its rules: no truncation, every option gets a probability, one fixed rendering):
   think=false (the board's latency rule: median, mean and p80 under 1 s per request), a long state limit with a
   capacity refusal ("maximum context length") instead of cutting, choices over 16 options read in groups of at most
-  16 then a final round between the group winners, and no yes/no commit band (a JevBench-specific rule).
+  16 then a final round between the group winners, and no yes/no commit band (a JevBench-specific rule). The prompt
+  layout (state_first, header, hybrid_header) and any second read of unsure answers are the model's own settings
+  (chon_config.json "prompt_layout" / "reread"; $CHON_REREAD overrides the second read) and are stated in the run's
+  provenance.
 """
 from __future__ import annotations
 
@@ -32,7 +35,8 @@ except ImportError:  # the kit is not installed: the helpers below still import
 class ChonEngine(Engine):
     name = "chon"
     latency = ("In-process request wall time, one request at a time: prompt construction and the forward passes "
-               "(one per question; two rounds for a choice with more than 16 options); excludes model loading.")
+               "(one per question; two rounds for a choice with more than 16 options; one more for an unsure "
+               "answer when a second read is set); excludes model loading.")
 
     def __init__(self, model="ninhnv/chon-1.0-12b", device="cuda", think=False, max_state_tokens=32768,
                  max_batch_tokens=32768, noul_commit=False, **options):
@@ -48,14 +52,34 @@ class ChonEngine(Engine):
         if not noul_commit:
             self.dm.noul_commit = None
         self._cuda = str(device).startswith("cuda") and torch.cuda.is_available()
+        rr = self.dm.reread
+        layout_text = {
+            "state_first": "the state, then the question and its options",
+            "header": "every distinct question of the request listed first (by its instructions, in request order), "
+                      "then the state, then the question and its options",
+            "hybrid_header": "for a request with two or more distinct questions, every distinct question listed "
+                             "first (by its instructions, in request order), then the state, then the question and "
+                             "its options; for a request with one, the state, then the question and its options",
+        }[self.dm.layout]
+        reread_text = (
+            f"A choice or yes/no answer whose top calibrated probability is under {rr['below']:g}, in a prompt of at "
+            f"most {rr['max_tokens']} tokens, is read a second time in the {rr['layout']!r} layout"
+            + ((" (the request written out twice" + (", the question list included when the first read had one)"
+                                                       if self.dm.layout != "state_first" else ")"))
+               if rr["layout"] == "twice" else "") +(" and the two distributions are averaged" if rr["combine"] == "avg"
+                           else " and the second read replaces the first")
+            + "; choices over 16 options are read once. " if rr else "Every question is read once (no second read). ")
         self.provenance = {
             "kind": "chon", "model": model, "think": bool(think), "max_state_tokens": int(max_state_tokens),
             "noul_commit": bool(noul_commit), "temperatures": self.dm.temperatures,
             "post_temperatures": self.dm.post_temperatures,
-            "policy": "One forward pass per question reading the option letters (A-P) after one fixed prompt; "
+            "prompt_layout": self.dm.layout, "reread": rr,
+            "policy": "One forward pass per question reading the option letters (A-P) after one fixed prompt "
+                      f"(layout {self.dm.layout!r}: {layout_text}); "
                       "choices with more than 16 options are read in groups of at most 16, then a final round "
-                      "between the group winners, P = P(group wins) x P(option | group). A state over "
-                      "max_state_tokens is refused as unsupported (maximum context length), never truncated."}
+                      "between the group winners, P = P(group wins) x P(option | group). " + reread_text +
+                      "A state over max_state_tokens is refused as unsupported (maximum context length), never "
+                      "truncated."}
 
     def __call__(self, state, questions):
         from chon.schema import ItemError

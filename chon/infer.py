@@ -8,10 +8,23 @@ The reasoning tokens are reported as output_tokens in usage.
 
     "think": {"tau": {"choice": 0.75, "noul": 0.92, "score": 0.7}, "budget": 512, "generator": "base",
               "mix": true, "temperatures": {"choice": 1.0, "noul": 0.5, "score": 1.0}}
+
+Prompt layout (config key "prompt_layout"): "state_first" (default), "header" (every question of the request listed
+before the state; chon.prompt.HEADER_LINE) or "hybrid_header" (the header for a request with two or more distinct
+questions, state-first for one). Any other value is refused.
+
+Optional second read of unsure answers (config key "reread", or $CHON_REREAD="below,layout,max_tokens,combine"):
+a choice or yes/no question whose top calibrated probability is under "below", in a prompt of at most "max_tokens"
+tokens, is read again in a second-read layout ("twice": the request written out twice, "twice_header" for a header
+read; or "sandwich") and the two distributions are averaged ("combine": "avg") or the second kept ("replace").
+Skipped when the request's deadline leaves no time for it.
+
+    "reread": {"below": 0.9, "layout": "twice", "max_tokens": 2000, "combine": "avg"}
 """
 
 from __future__ import annotations
 
+import json
 import math
 import os
 import time
@@ -23,8 +36,10 @@ from .answers import format_answer
 from .modeling import (letter_logits, left_pad, load_causal_lm, load_tokenizer, read_model_config)
 import contextlib
 
-from .prompt import INLINE_PREFIX, INLINE_SUFFIX, PromptBuilder, suffix_letter_ids
-from .schema import MAX_OPTIONS, CapacityError, ItemError, options_for, validate_item
+from .prompt import INLINE_PREFIX, INLINE_SUFFIX, REREAD_LAYOUTS, PromptBuilder, suffix_letter_ids
+from .schema import MAX_OPTIONS, CapacityError, ItemError, instructions_text, options_for, validate_item
+
+PROMPT_LAYOUTS = ("state_first", "header", "hybrid_header")
 
 
 class DeadlineExceeded(RuntimeError):
@@ -53,6 +68,45 @@ def softmax(xs: Sequence[float], temperature: float = 1.0) -> list[float]:
     e = [math.exp((x - m) / t) for x in xs]
     s = sum(e)
     return [v / s for v in e]
+
+
+REREAD_DEFAULTS = {"below": 0.9, "layout": "twice", "max_tokens": 2000, "types": ["choice", "noul"], "combine": "avg"}
+REREAD_COMBINE = ("avg", "replace")   # average the two reads, or keep the second
+
+
+def parse_reread(cfg_value: dict | None, env: str | None = None) -> dict | None:
+    """The second-read setting: the model config's "reread" (a dict, or a number = its threshold), overridden by
+    $CHON_REREAD ("0.9", "0.9,sandwich", "0.9,twice,2000", "0.9,twice,,replace"; "0" or "off" switches it off).
+    None = one read."""
+    rr = None
+    if isinstance(cfg_value, (int, float)) and not isinstance(cfg_value, bool):
+        cfg_value = {"below": cfg_value}
+    if isinstance(cfg_value, dict) and float(cfg_value.get("below", 0) or 0) > 0:
+        rr = {**REREAD_DEFAULTS, **cfg_value}
+    if env is not None and env.strip() != "":
+        parts = [x.strip() for x in env.split(",")]
+        if parts[0].lower() in ("0", "off", "none", "false"):
+            return None
+        rr = {**(rr or REREAD_DEFAULTS), "below": float(parts[0])}
+        if len(parts) > 1 and parts[1]:
+            rr["layout"] = parts[1]
+        if len(parts) > 2 and parts[2]:
+            rr["max_tokens"] = int(parts[2])
+        if len(parts) > 3 and parts[3]:
+            rr["combine"] = parts[3]
+    if rr is None:
+        return None
+    if rr["layout"] not in REREAD_LAYOUTS:
+        raise ValueError(f"unknown reread layout {rr['layout']!r} (one of {REREAD_LAYOUTS})")
+    if rr["combine"] not in REREAD_COMBINE:
+        raise ValueError(f"unknown reread combine {rr['combine']!r} (one of {REREAD_COMBINE})")
+    rr["below"], rr["max_tokens"], rr["types"] = float(rr["below"]), int(rr["max_tokens"]), list(rr["types"])
+    return rr
+
+
+def _state_key(state: Any) -> str:
+    """Questions about the same state (by its text) belong to one request."""
+    return state if isinstance(state, str) else json.dumps(state, sort_keys=True, default=str)
 
 
 def generation_context(model, generator: str):
@@ -121,6 +175,15 @@ class DecisionModel:
                                      chat_template_kwargs=cfg.get("chat_template_kwargs"),
                                      answer_prefix=cfg.get("answer_prefix", ""))
         self.letter_ids = torch.tensor(self.builder.letter_ids, dtype=torch.long, device=self.device)
+        # prompt layout the model was trained (or is read) with: "state_first" (default), "header" (the request's
+        # questions listed before the state) or "hybrid_header" (the header for a request with two or more distinct
+        # questions, state-first for one). Refused otherwise: a model read in the wrong layout answers worse silently.
+        self.layout = cfg.get("prompt_layout") or "state_first"
+        if self.layout not in PROMPT_LAYOUTS:
+            raise ValueError(f"unknown prompt_layout {self.layout!r} in the model config (one of {PROMPT_LAYOUTS}); "
+                             f"this model needs a newer version of the chon serving code")
+        self._req_layout: str | None = None
+        self._req_asked: list[str] | None = None   # the header layout's question list for the current request
         self.temperatures = {"choice": 1.0, "noul": 1.0, "score": 1.0, **cfg.get("temperatures", {})}
         self.max_batch_tokens = int(max_batch_tokens)
         # yes/no commit rule: a P(yes) strictly between 0.2 and 0.8 is an abstention under common scoring, so a served
@@ -130,6 +193,12 @@ class DecisionModel:
         self.post_temperatures = dict(cfg.get("post_temperatures") or {})
         nc = cfg.get("noul_commit")
         self.noul_commit = (float(nc[0]), float(nc[1])) if nc else None
+        # second read of an unsure answer: a choice or yes/no question whose top calibrated probability is under
+        # reread["below"], in a prompt of at most reread["max_tokens"] tokens, is read again in a second-read layout
+        # (prompt.REREAD_LAYOUTS) and the two distributions are averaged (or the second kept: combine "replace").
+        # Off unless the config has "reread" or $CHON_REREAD sets it; never for choices over 16 options.
+        self.reread = parse_reread(cfg.get("reread"), os.environ.get("CHON_REREAD"))
+        self.reread_stats = {"questions": 0, "reread": 0, "extra_tokens": 0, "deadline_skipped": 0}
         self.think = dict(cfg["think"]) if cfg.get("think") else None
         self.think_tokens: list[int | None] = []
         # deadline (predict(..., deadline=)): the one-pass answer is always kept; the reasoning runs only with the
@@ -219,9 +288,38 @@ class DecisionModel:
         return dm
 
     # ------------------------------------------------------------------ core
+    def layout_for(self, n_questions: int) -> str:
+        """The layout for one of n_questions (distinct) questions asked about the same state."""
+        if self.layout == "hybrid_header":
+            return "header" if n_questions > 1 else "state_first"
+        return self.layout
+
+    def served_reads(self, pairs: Sequence[tuple[Any, dict]]) -> list[tuple[str | None, list[str] | None]]:
+        """(layout, asked) per (state, question), as distributions() reads them when they arrive together: every
+        question about the same state listed in the header (distinct instructions, in order). For offline reads that
+        call encode() directly, so they match serving."""
+        if self.layout not in ("header", "hybrid_header"):
+            return [(None, None)] * len(pairs)
+        asked_of: dict = {}
+        for st, q in pairs:
+            lst = asked_of.setdefault(_state_key(st), [])
+            if instructions_text(q) not in lst:
+                lst.append(instructions_text(q))
+        return [(self.layout_for(len(asked_of[_state_key(st)])), asked_of[_state_key(st)]) for st, _ in pairs]
+
     def encode(self, state: Any, question: dict, order: Sequence[str] | None = None,
-               fitted_state: str | None = None) -> list[int]:
-        return self.builder.encode(state, question, order=order, fitted_state=fitted_state)
+               fitted_state: str | None = None, layout: str | None = None,
+               asked: Sequence[str] | None = None) -> list[int]:
+        """layout: None = the current request's layout (inside predict), else the model's layout for one question.
+        asked: the header's question list (default: the current request's, else this question alone)."""
+        layout = layout or self._req_layout or self.layout_for(1)
+        if layout == "twice" and (self.layout == "header" or (   # a header read's second read: its layout, twice
+                self.layout == "hybrid_header" and len(asked or self._req_asked or []) > 1)):
+            layout = "twice_header"
+        if layout in ("header", "twice_header"):
+            return self.builder.encode(state, question, order=order, fitted_state=fitted_state, layout=layout,
+                                       asked=asked or self._req_asked or [instructions_text(question)])
+        return self.builder.encode(state, question, order=order, fitted_state=fitted_state, layout=layout)
 
     @torch.inference_mode()
     def raw_logits(self, seqs: Sequence[Sequence[int]], n_options: Sequence[int],
@@ -243,6 +341,32 @@ class DecisionModel:
                 out[j] = row[: n_options[j]]
             i += n
         return out  # type: ignore[return-value]
+
+    # ------------------------------------------------------------------ second read when unsure
+    def _apply_reread(self, qtypes, orders, seqs, probs, encode_at, logits_fn) -> tuple[int, int]:
+        """Average a second read into the probabilities of unsure questions, or put it in place of the first
+        (reread["combine"] = "replace"), in place (calibrated probabilities). Skipped when the request's deadline
+        leaves no time for another read. encode_at(i, layout) -> the second-read ids of question i.
+        Returns (questions re-read, their prompt tokens)."""
+        rr = self.reread
+        self.reread_stats["questions"] += len(seqs)
+        if not rr:
+            return 0, 0
+        if self._deadline is not None and time.monotonic() + 2 * self._read_s + 0.5 > self._deadline:
+            self.reread_stats["deadline_skipped"] += 1
+            return 0, 0   # no time for a second read: the first stands
+        idx = [i for i in range(len(seqs)) if qtypes[i] in rr["types"] and max(probs[i]) < rr["below"]
+               and len(seqs[i]) <= rr["max_tokens"]]
+        if not idx:
+            return 0, 0
+        seqs2 = [encode_at(i, rr["layout"]) for i in idx]
+        for i, row in zip(idx, logits_fn(seqs2, [len(orders[i]) for i in idx])):
+            p2 = softmax(row, self.temperatures.get(qtypes[i], 1.0))
+            probs[i] = list(p2) if rr.get("combine") == "replace" else [(a + b) / 2 for a, b in zip(probs[i], p2)]
+        extra = sum(len(x) for x in seqs2)
+        self.reread_stats["reread"] += len(idx)
+        self.reread_stats["extra_tokens"] += extra
+        return len(idx), extra
 
     # ------------------------------------------------------------------ think when unsure
     def unsure(self, qtype: str, order: Sequence[str], probs: Sequence[float]) -> bool:
@@ -420,21 +544,39 @@ class DecisionModel:
                 probs[i] = [py if j == y else 1.0 - py for j in range(len(order))]
 
     def distributions(self, requests: Sequence[tuple[Any, dict, Sequence[str] | None]],
-                      calibrated: bool = True, think: bool = True) -> list[dict[str, float]]:
-        """requests: (state, question, option order or None). Returns label -> probability."""
-        seqs, orders = [], []
+                      calibrated: bool = True, think: bool = True,
+                      group_states: bool = True) -> list[dict[str, float]]:
+        """requests: (state, question, option order or None). Returns label -> probability.
+        group_states=False: every request is its own request (one question); by default the questions about one
+        state are read as one request (a header model lists them all). The second read applies to calibrated reads
+        only (temperatures are fitted on single reads)."""
+        seqs, orders, fitted, asked = [], [], [], []
         fitted_cache: dict[int, str] = {}
-        for state, question, order in requests:
+        asked_of: dict = {}
+        if self.layout in ("header", "hybrid_header"):  # every question asked about each state, in order, once each
+            for r, (state, question, _) in enumerate(requests):
+                lst = asked_of.setdefault(_state_key(state) if group_states else r, [])
+                if instructions_text(question) not in lst:
+                    lst.append(instructions_text(question))
+        for r, (state, question, order) in enumerate(requests):
             if order is None:
                 order = [lab for lab, _ in options_for(question)]
             key = id(state)
             if key not in fitted_cache:
                 fitted_cache[key] = self.builder.fit_state(state)[0]
-            seqs.append(self.encode(state, question, order, fitted_state=fitted_cache[key]))
+            asked.append(asked_of.get(_state_key(state) if group_states else r))
+            seqs.append(self.encode(state, question, order, fitted_state=fitted_cache[key],
+                                    layout=self.layout_for(len(asked[-1] or [None])), asked=asked[-1]))
             orders.append(list(order))
+            fitted.append(fitted_cache[key])
         logits = self.raw_logits(seqs, [len(o) for o in orders])
         qtypes = [q["type"] for _, q, _ in requests]
         probs = [softmax(lg, self.temperatures.get(qt, 1.0) if calibrated else 1.0) for lg, qt in zip(logits, qtypes)]
+        if calibrated:
+            self._apply_reread(qtypes, orders, seqs, probs,
+                               lambda i, lay: self.encode(requests[i][0], requests[i][1], orders[i],
+                                                          fitted_state=fitted[i], layout=lay, asked=asked[i]),
+                               self.raw_logits)
         self.think_tokens = self._apply_think(qtypes, orders, seqs, logits, probs) if (think and calibrated) \
             else [None] * len(seqs)
         if calibrated:
@@ -445,10 +587,11 @@ class DecisionModel:
     def predict(self, state: Any, questions: dict[str, dict], deadline: float | None = None) -> tuple[dict, dict]:
         """TypeSafe /v1/systemone semantics. Returns (answers, usage).
         deadline: a time.monotonic() by which to answer (chon.serve sets it from the request's arrival): the
-        one-pass answers always stand; the reasoning of unsure answers runs only if it fits before it.
+        one-pass answers always stand; a second read or the reasoning of unsure answers runs only if it fits before it.
         A choice with more than MAX_OPTIONS options (up to MAX_OPTIONS ** 2) is read in groups, then a final round
         between the group winners (_predict_many). cfg "truncate": false refuses a state over max_state_tokens with
-        a CapacityError instead of cutting it."""
+        a CapacityError instead of cutting it. A header model lists the request's distinct questions (by their
+        instructions, in request order) in every read of this request, the groups and final rounds included."""
         if not isinstance(questions, dict) or not questions:
             raise ItemError("questions must be a non-empty object")
         names = list(questions)
@@ -468,43 +611,57 @@ class DecisionModel:
             raise CapacityError(f"the state is longer than {self.builder.max_state_tokens} tokens: maximum context "
                                 f"length exceeded (this model does not truncate)")
         normal = [n for n in names if n not in many]
+        asked_all = list(dict.fromkeys(instructions_text(questions[n]) for n in names))
         answers: dict[str, dict] = {}
         usage = {"input_tokens": 0, "output_tokens": 0, "forward_s": 0.0}
         t0 = time.perf_counter()
+        # hybrid_header counts distinct questions (two names with the same instructions are one question listed):
+        # every encode of this request (first reads, second reads, groups, finals) uses this layout and list
+        self._req_layout = self.layout_for(len(asked_all) if self.layout == "hybrid_header" else len(names))
+        self._req_asked = asked_all if self._req_layout == "header" else None
         self._deadline = deadline
         if deadline is not None:
             self.deadline_stats["requests"] += 1
-        if normal:
-            seqs, orders = [], []
-            for n in normal:
-                q = questions[n]
-                order = [lab for lab, _ in options_for(q)]
-                seqs.append(self.encode(state, q, order, fitted_state=fitted))
-                orders.append(order)
-            t_read = time.monotonic()
-            logits = self.raw_logits(seqs, [len(o) for o in orders])
-            self._read_s = 0.8 * self._read_s + 0.2 * (time.monotonic() - t_read)
-            qtypes = [questions[n]["type"] for n in normal]
-            probs = [softmax(lg, self.temperatures.get(qt, 1.0)) for lg, qt in zip(logits, qtypes)]
-            try:
+        try:
+            if normal:
+                seqs, orders = [], []
+                for n in normal:
+                    q = questions[n]
+                    order = [lab for lab, _ in options_for(q)]
+                    seqs.append(self.encode(state, q, order, fitted_state=fitted))
+                    orders.append(order)
+                t_read = time.monotonic()
+                logits = self.raw_logits(seqs, [len(o) for o in orders])
+                self._read_s = 0.8 * self._read_s + 0.2 * (time.monotonic() - t_read)
+                qtypes = [questions[n]["type"] for n in normal]
+                probs = [softmax(lg, self.temperatures.get(qt, 1.0)) for lg, qt in zip(logits, qtypes)]
+                n_rr, rr_tokens = self._apply_reread(
+                    qtypes, orders, seqs, probs,
+                    lambda i, lay: self.encode(state, questions[normal[i]], orders[i], fitted_state=fitted, layout=lay),
+                    self.raw_logits)
+                if n_rr:
+                    usage["input_tokens"] += rr_tokens
+                    usage["reread"] = n_rr
                 thought = self._apply_think(qtypes, orders, seqs, logits, probs)
-            finally:
-                self._deadline = None
-            self._commit(qtypes, orders, probs)
-            for n, order, p in zip(normal, orders, probs):
-                answers[n] = format_answer(questions[n], dict(zip(order, p)))
-            n_thought = sum(1 for t in thought if t is not None)
-            extra_in = n_thought * (len(self._prefix) + len(self._suffix)) if self.think else 0
-            usage["input_tokens"] += sum(len(s) for s in seqs) + extra_in
-            usage["output_tokens"] += sum(t for t in thought if t is not None)
-            if self.think:
-                usage["thought"] = n_thought
-        else:
-            self.think_tokens = []
-        if many:
-            more, n_in = self._predict_many(state, many, fitted)
-            answers.update(more)
-            usage["input_tokens"] += n_in
+                self._commit(qtypes, orders, probs)
+                for n, order, p in zip(normal, orders, probs):
+                    answers[n] = format_answer(questions[n], dict(zip(order, p)))
+                n_thought = sum(1 for t in thought if t is not None)
+                extra_in = n_thought * (len(self._prefix) + len(self._suffix)) if self.think else 0
+                usage["input_tokens"] += sum(len(s) for s in seqs) + extra_in
+                usage["output_tokens"] += sum(t for t in thought if t is not None)
+                if self.think:
+                    usage["thought"] = n_thought
+            else:
+                self.think_tokens = []
+            if many:
+                more, n_in = self._predict_many(state, many, fitted)
+                answers.update(more)
+                usage["input_tokens"] += n_in
+        finally:   # the layout, question list and deadline belong to this request only
+            self._req_layout = None
+            self._req_asked = None
+            self._deadline = None
         usage["forward_s"] = round(time.perf_counter() - t0, 4)
         return {n: answers[n] for n in names}, usage
 
