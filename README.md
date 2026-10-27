@@ -54,6 +54,11 @@ Options:
   a short extra pass for unsure questions.
 - `--think-set KEY=VALUE`: override one setting of that extra pass, e.g. `--think-set engine=hf-static` to
   skip vLLM (below).
+- `--deadline SECONDS` (default 8; `CHON_DEADLINE_S`; `0` turns it off): every reply is sent within this many
+  seconds of the request's arrival, time spent waiting for the GPU included. The single-pass answer is always
+  computed first and kept; the extra pass for an unsure question runs only with the time left (shortened, or
+  skipped when too little remains) and is dropped if the clock runs out, so a client with a time limit never
+  waits past it for a better answer. `/health` reports how often the extra pass was shortened, skipped or cut.
 
 ### Faster reasoning (vLLM)
 

@@ -7,6 +7,11 @@ Response: {"model": "...", "answers": {"<name>": {...}}, "usage": {"input_tokens
 
 Optional bearer auth: set CHON_API_KEY. Requests are served one at a time on the GPU (the
 benchmarks measure serial latency; a lock keeps measurements clean).
+
+Deadline (--deadline, default 8 s; $CHON_DEADLINE_S; 0 switches it off): counted from the request's arrival,
+waiting for the GPU included. The one-pass answer is always computed and kept; the reasoning of an unsure answer
+runs only with the time left, shortened or skipped to fit, and dropped if the clock runs out, so a reply never
+waits past a client's time limit for a better answer.
 """
 
 
@@ -17,7 +22,7 @@ import threading
 import time
 
 
-def create_app(model, api_key: str | None = None):
+def create_app(model, api_key: str | None = None, deadline_s: float = 0.0):
     from fastapi import FastAPI, Header, HTTPException, Request
     from fastapi.responses import JSONResponse
 
@@ -32,7 +37,8 @@ def create_app(model, api_key: str | None = None):
 
     @app.get("/health")
     def health():
-        return {"ok": True, "model": model.name}
+        return {"ok": True, "model": model.name, "deadline_s": deadline_s or None,
+                "deadline": dict(getattr(model, "deadline_stats", {}) or {})}
 
     @app.get("/v1/models")
     def models():
@@ -48,10 +54,13 @@ def create_app(model, api_key: str | None = None):
         if not isinstance(body, dict) or "state" not in body or "questions" not in body:
             return JSONResponse({"error": "body needs 'state' and 'questions'"}, status_code=400)
         t0 = time.perf_counter()
+        due = time.monotonic() + deadline_s if deadline_s else None   # from arrival: queueing counts too
 
         def work():
             with lock:
-                return model.predict(body["state"], body["questions"])
+                if due is None:
+                    return model.predict(body["state"], body["questions"])
+                return model.predict(body["state"], body["questions"], deadline=due)
 
         try:
             import anyio
@@ -80,6 +89,9 @@ def main(argv=None) -> None:
     ap.add_argument("--no-think", action="store_true", help="ignore a think config in the model's chon_config")
     ap.add_argument("--think-set", action="append", default=[], metavar="KEY=VALUE",
                     help="override one think setting, e.g. engine=hf to skip vLLM (repeatable)")
+    ap.add_argument("--deadline", type=float, default=float(os.environ.get("CHON_DEADLINE_S", "8")),
+                    help="seconds from a request's arrival to its answer: the reasoning is shortened or skipped to "
+                         "fit, the one-pass answer always stands (0 = no deadline; default 8, $CHON_DEADLINE_S)")
     ap.add_argument("--host", default="0.0.0.0")
     ap.add_argument("--port", type=int, default=8000)
     args = ap.parse_args(argv)
@@ -97,9 +109,25 @@ def main(argv=None) -> None:
             model.think[k] = json.loads(v) if v[:1] in "[{0123456789" or v in ("true", "false", "null") else v
     print(f"[serve] {model.name} on {model.device}"
           + (f", reasoning engine {model.think.get('engine', 'hf')}" if model.think else ", no reasoning"), flush=True)
-    # warm-up so the first measured request is not a cold start
+    # warm-up so the first measured request is not a cold start; the reasoning path too (its first call compiles,
+    # and its speed sets how many tokens a deadline allows)
     model.predict("warm-up", {"w": {"type": "noul", "instructions": "Is this a warm-up?"}})
-    uvicorn.run(create_app(model, os.environ.get("CHON_API_KEY")), host=args.host, port=args.port,
+    if model.think:
+        warm = model.encode("Warm-up record: the order total is 120 and the limit is 100.",
+                            {"type": "noul", "instructions": "Is the order within the limit?"}, ["yes", "no"])
+        for _ in range(2):   # the first call compiles: only the second, warm one sets the speed estimate
+            model._gen_spt = None
+            try:
+                model.think_logprobs([warm], [2], budget=48)
+            except Exception as e:  # noqa: BLE001
+                print(f"[serve] reasoning warm-up failed: {e!r:.200}", flush=True)
+                break
+        spt = getattr(model, "_gen_spt", None)
+        print(f"[serve] reasoning speed {1 / spt:.0f} tokens/s" if spt else "[serve] reasoning speed not measured",
+              flush=True)
+    if args.deadline:
+        print(f"[serve] deadline {args.deadline:g} s per request (one-pass answers always kept)", flush=True)
+    uvicorn.run(create_app(model, os.environ.get("CHON_API_KEY"), args.deadline), host=args.host, port=args.port,
                 log_level="warning")
 
 

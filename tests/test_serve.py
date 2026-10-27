@@ -77,3 +77,60 @@ def test_noul_probabilities_and_hidden_keys():
     assert a["noul"] == 0.25 and a["probabilities"] == {"true": 0.25, "false": 0.75}
     q = {"type": "choice", "instructions": "Which?", "criteria": {"0": "refund", "1": "replace"}, "option_keys": "hide"}
     assert "A) refund" in question_text(q, ["0", "1"]) and "0 —" not in question_text(q, ["0", "1"])
+
+
+def test_deadline_is_passed_from_arrival():
+    import time
+
+    class Timed(FakeModel):
+        got = "unset"
+
+        def predict(self, state, questions, deadline=None):
+            Timed.got = deadline
+            return super().predict(state, questions)
+    t = time.monotonic()
+    c = TestClient(create_app(Timed(), None, deadline_s=8.0))
+    body = {"state": "s", "questions": {"b": {"type": "noul", "instructions": "is it?"}}}
+    assert c.post("/v1/systemone", json=body).status_code == 200
+    assert t + 7.5 < Timed.got <= time.monotonic() + 8.0 and c.get("/health").json()["deadline_s"] == 8.0
+
+
+def _thinker(spt=0.01):
+    """A DecisionModel with only what _apply_think reads (no weights): every answer counts as unsure."""
+    from collections import deque
+
+    from chon.infer import DecisionModel
+    m = object.__new__(DecisionModel)
+    m.think = {"tau": {"choice": 1.01, "noul": 1.01, "score": 1.01}, "budget": 512, "mix": True,
+               "temperatures": {"choice": 1.0, "noul": 1.0, "score": 1.0}}
+    m._recent, m._read_s, m._gen_spt, m._deadline = deque(maxlen=10), 0.01, spt, None
+    m.deadline_stats = {"requests": 0, "skipped": 0, "shortened": 0, "cut": 0}
+    return m
+
+
+def test_deadline_shortens_skips_and_cuts_the_reasoning():
+    import time
+
+    from chon.infer import DeadlineExceeded
+    seen = {}
+
+    def think(seqs, n_options, budget=None, max_time=None):
+        seen.update(budget=budget, max_time=max_time)
+        return [[0.0, -5.0] for _ in seqs], [budget for _ in seqs]
+    m = _thinker(spt=0.01)
+    m.think_logprobs = think
+    probs = [[0.5, 0.5]]
+    m._deadline = time.monotonic() + 2.0      # ~1.5 s of reasoning at 100 tokens/s: 512 shortened to ~150
+    assert m._apply_think(["noul"], [["yes", "no"]], [[1, 2]], [[0.0, 0.0]], probs) == [seen["budget"]]
+    assert 48 <= seen["budget"] < 512 and m.deadline_stats["shortened"] == 1 and probs[0][0] > 0.5
+    probs = [[0.5, 0.5]]
+    m._deadline = time.monotonic() + 0.1      # no time left: the one-pass answer stands
+    assert m._apply_think(["noul"], [["yes", "no"]], [[1, 2]], [[0.0, 0.0]], probs) == [None]
+    assert probs == [[0.5, 0.5]] and m.deadline_stats["skipped"] == 1
+
+    def cut(seqs, n_options, budget=None, max_time=None):
+        raise DeadlineExceeded("cut", [30])
+    m.think_logprobs = cut
+    m._deadline = time.monotonic() + 3.0
+    assert m._apply_think(["noul"], [["yes", "no"]], [[1, 2]], [[0.0, 0.0]], probs) == [30]   # tokens paid for
+    assert probs == [[0.5, 0.5]] and m.deadline_stats["cut"] == 1

@@ -27,6 +27,15 @@ from .prompt import INLINE_PREFIX, INLINE_SUFFIX, PromptBuilder, suffix_letter_i
 from .schema import MAX_OPTIONS, CapacityError, ItemError, options_for, validate_item
 
 
+class DeadlineExceeded(RuntimeError):
+    """The optional reasoning did not fit the request's time budget: the one-pass answer stands. tokens: what was
+    generated per question before the cut (reported as output tokens: they were paid for)."""
+
+    def __init__(self, msg: str, tokens: list[int] | None = None):
+        super().__init__(msg)
+        self.tokens = tokens
+
+
 def log_softmax(xs: Sequence[float]) -> list[float]:
     m = max(xs)
     z = math.log(sum(math.exp(x - m) for x in xs))
@@ -123,6 +132,13 @@ class DecisionModel:
         self.noul_commit = (float(nc[0]), float(nc[1])) if nc else None
         self.think = dict(cfg["think"]) if cfg.get("think") else None
         self.think_tokens: list[int | None] = []
+        # deadline (predict(..., deadline=)): the one-pass answer is always kept; the reasoning runs only with the
+        # tokens the time left allows (seconds per token measured per call, first at the server's warm-up), and a
+        # call cut by the clock keeps the one-pass answer
+        self._deadline: float | None = None
+        self._read_s = 0.15
+        self._gen_spt: float | None = None
+        self.deadline_stats = {"requests": 0, "skipped": 0, "shortened": 0, "cut": 0}
         if self.think:
             self.think.setdefault("budget", 512)
             self.think.setdefault("generator", "base")
@@ -243,7 +259,7 @@ class DecisionModel:
             stop.add(self.tok.convert_tokens_to_ids("<end_of_turn>"))
         return stop
 
-    def _generate_vllm(self, prompts: list[list[int]], max_new: int) -> list[list[int]]:
+    def _generate_vllm(self, prompts: list[list[int]], max_new: int, max_time: float | None = None) -> list[list[int]]:
         """The reasoning written by a vLLM server running the plain base model (think "engine": "vllm"; only
         for generator "base", whose reasoning comes from the base weights anyway). Same greedy decoding from the
         same token ids; the letters are still read by this model. Server: think["vllm_url"] or $CHON_VLLM_URL
@@ -266,7 +282,7 @@ class DecisionModel:
                     "return_tokens_as_token_ids": True}
             req = urllib.request.Request(url + "/v1/completions", data=_json.dumps(body).encode(),
                                          headers={"Content-Type": "application/json"})
-            with urllib.request.urlopen(req, timeout=900) as r:
+            with urllib.request.urlopen(req, timeout=max_time if max_time else 900) as r:
                 ch = _json.load(r)["choices"][0]
             toks = (ch.get("logprobs") or {}).get("tokens") or []
             out = [int(t.split(":", 1)[1]) for t in toks if isinstance(t, str) and t.startswith("token_id:")]
@@ -280,13 +296,15 @@ class DecisionModel:
             return list(ex.map(one, prompts))
 
     @torch.inference_mode()
-    def _generate(self, prompts: list[list[int]], max_new: int) -> list[list[int]]:
+    def _generate(self, prompts: list[list[int]], max_new: int, max_time: float | None = None) -> list[list[int]]:
         """Greedy continuations (stop tokens dropped), longest first, batches capped by prompt+new tokens.
         think "engine": "hf" (default), "hf-static" (static KV cache, which transformers compiles), "vllm"."""
         engine = self.think.get("engine", "hf")
         if engine == "vllm":
-            return self._generate_vllm(prompts, max_new)
+            return self._generate_vllm(prompts, max_new, max_time)
         extra = {"cache_implementation": "static"} if engine == "hf-static" else {}
+        if max_time:
+            extra["max_time"] = float(max_time)   # transformers stops generating at this many seconds
         ctx = generation_context(self.model, self.think["generator"])
         pad = self.tok.pad_token_id
         stop = self._stop_ids()
@@ -314,9 +332,23 @@ class DecisionModel:
             i += n
         return out
 
-    def think_logprobs(self, seqs: list[list[int]], n_options: list[int]) -> tuple[list[list[float]], list[int]]:
-        """Reason (up to budget tokens) after each served prompt, then read the letters after the suffix."""
-        gens = self._generate([s + self._prefix for s in seqs], int(self.think["budget"]))
+    def think_logprobs(self, seqs: list[list[int]], n_options: list[int], budget: int | None = None,
+                       max_time: float | None = None) -> tuple[list[list[float]], list[int]]:
+        """Reason (up to budget tokens) after each served prompt, then read the letters after the suffix.
+        max_time: seconds the reasoning may take; past it the call raises DeadlineExceeded."""
+        budget = int(self.think["budget"]) if budget is None else int(budget)
+        t0 = time.monotonic()
+        try:
+            gens = self._generate([s + self._prefix for s in seqs], budget, max_time)
+        except OSError as e:   # the vLLM request timed out
+            raise DeadlineExceeded(f"reasoning did not finish in {max_time} s") from e
+        took = time.monotonic() - t0
+        longest = max((len(g) for g in gens), default=0)
+        if longest >= 8:   # seconds per generated token for this engine, a moving average
+            spt = took / longest
+            self._gen_spt = spt if self._gen_spt is None else 0.7 * self._gen_spt + 0.3 * spt
+        if max_time and took >= 0.97 * max_time and longest < budget:
+            raise DeadlineExceeded(f"reasoning cut at {took:.1f} s", [len(g) for g in gens])
         reads = [s + self._prefix + g + self._suffix for s, g in zip(seqs, gens)]
         logits = self.raw_logits(reads, n_options, letter_ids=self._suffix_letters)
         return [log_softmax(lg) for lg in logits], [len(g) for g in gens]
@@ -342,7 +374,25 @@ class DecisionModel:
             idx = keep
         if not idx:
             return gen_tokens
-        lps, ntoks = self.think_logprobs([seqs[i] for i in idx], [len(orders[i]) for i in idx])
+        budget, max_time = int(self.think["budget"]), None
+        if self._deadline is not None:   # only the tokens the time left allows; none if too few to help
+            left = self._deadline - time.monotonic() - 2 * self._read_s - float(self.think.get("deadline_margin_s", 0.5))
+            spt = self._gen_spt or float(self.think.get("seconds_per_token", 0.05))
+            allowed = int(left / spt) if left > 0 else 0
+            if allowed < int(self.think.get("min_think_tokens", 48)):
+                self.deadline_stats["skipped"] += len(idx)
+                return gen_tokens
+            if allowed < budget:
+                self.deadline_stats["shortened"] += len(idx)
+                budget = allowed
+            max_time = left
+        try:
+            lps, ntoks = self.think_logprobs([seqs[i] for i in idx], [len(orders[i]) for i in idx], budget, max_time)
+        except DeadlineExceeded as e:
+            self.deadline_stats["cut"] += len(idx)
+            for i, n in zip(idx, e.tokens or []):
+                gen_tokens[i] = n
+            return gen_tokens
         for i, lp, n in zip(idx, lps, ntoks):
             if self.think["mix"]:
                 lp = mean_logprob([log_softmax(logits[i]), lp])
@@ -392,8 +442,10 @@ class DecisionModel:
         return [dict(zip(order, p)) for order, p in zip(orders, probs)]
 
     # ------------------------------------------------------------------ API shape
-    def predict(self, state: Any, questions: dict[str, dict]) -> tuple[dict, dict]:
+    def predict(self, state: Any, questions: dict[str, dict], deadline: float | None = None) -> tuple[dict, dict]:
         """TypeSafe /v1/systemone semantics. Returns (answers, usage).
+        deadline: a time.monotonic() by which to answer (chon.serve sets it from the request's arrival): the
+        one-pass answers always stand; the reasoning of unsure answers runs only if it fits before it.
         A choice with more than MAX_OPTIONS options (up to MAX_OPTIONS ** 2) is read in groups, then a final round
         between the group winners (_predict_many). cfg "truncate": false refuses a state over max_state_tokens with
         a CapacityError instead of cutting it."""
@@ -419,6 +471,9 @@ class DecisionModel:
         answers: dict[str, dict] = {}
         usage = {"input_tokens": 0, "output_tokens": 0, "forward_s": 0.0}
         t0 = time.perf_counter()
+        self._deadline = deadline
+        if deadline is not None:
+            self.deadline_stats["requests"] += 1
         if normal:
             seqs, orders = [], []
             for n in normal:
@@ -426,10 +481,15 @@ class DecisionModel:
                 order = [lab for lab, _ in options_for(q)]
                 seqs.append(self.encode(state, q, order, fitted_state=fitted))
                 orders.append(order)
+            t_read = time.monotonic()
             logits = self.raw_logits(seqs, [len(o) for o in orders])
+            self._read_s = 0.8 * self._read_s + 0.2 * (time.monotonic() - t_read)
             qtypes = [questions[n]["type"] for n in normal]
             probs = [softmax(lg, self.temperatures.get(qt, 1.0)) for lg, qt in zip(logits, qtypes)]
-            thought = self._apply_think(qtypes, orders, seqs, logits, probs)
+            try:
+                thought = self._apply_think(qtypes, orders, seqs, logits, probs)
+            finally:
+                self._deadline = None
             self._commit(qtypes, orders, probs)
             for n, order, p in zip(normal, orders, probs):
                 answers[n] = format_answer(questions[n], dict(zip(order, p)))
