@@ -113,13 +113,46 @@ CASES = [
 ]
 
 
-def run_case(DecisionModel, model, tok, case: dict, deadline: float | None = None) -> dict:
-    """Run one case; returns every read (token ids, number of options, in call order) and the outputs."""
+# ---- the shared-prefix read: every case above with it on, plus states longer than the tiny model's 64-token sliding
+# window (so the cached prefix crosses it) -----------------------------------------------------------------------------
+LONG_STATE = " ".join(f"Parcel {i} weighs {i % 7} kg and goes to depot {i % 3}." for i in range(30))
+LONG_JSON = {"ticket": 31, "lines": [{"sku": f"A{i}", "qty": i % 4, "note": f"box {i} of the order"} for i in range(16)]}
+
+PREFIX_EXTRA = [
+    _p("long_state_first", "state_first", {"route": ROUTE, "within": WITHIN, "severe": SEVERE, "team": DICT_INSTR},
+       state=LONG_STATE),
+    _p("long_header", "header", {"route": ROUTE, "within": WITHIN, "severe": SEVERE}, state=LONG_JSON),
+    _p("long_header_many_reread", "header", {"line": MANY, "wh": MANY_LIST, "route": ROUTE, "within": WITHIN},
+       state=LONG_STATE, reread=RR_ALL),
+    _p("long_state_first_many_reread", "state_first", {"line": MANY, "route": ROUTE, "within": WITHIN},
+       state=LONG_JSON, reread={**RR_ALL, "combine": "replace"}),
+    _p("long_hybrid_reread", "hybrid_header", {"a": ROUTE, "b": ROUTE_LIST, "within": WITHIN}, state=LONG_STATE,
+       reread=RR_ALL),
+    _p("long_many_alone", "header", {"line": MANY}, state=LONG_STATE),
+    _p("long_sandwich", "header", {"route": ROUTE, "within": WITHIN}, state=LONG_STATE,
+       reread={**RR_ALL, "layout": "sandwich"}),
+    _d("long_dist_header", "header", [(LONG_STATE, ROUTE, None), (LONG_STATE, WITHIN, None), (LONG_JSON, SEVERE, None),
+                                      (LONG_JSON, ROUTE, None), (TEXT_STATE, WITHIN, None)]),
+    _d("long_dist_state_first", "state_first", [(LONG_STATE, ROUTE, None), (LONG_STATE, WITHIN, None),
+                                                (LONG_STATE, SEVERE, None)], reread=RR_ALL),
+]
+PREFIX_CASES = CASES + PREFIX_EXTRA
+
+
+def run_case(DecisionModel, model, tok, case: dict, deadline: float | None = None, prefix_cache: bool = False) -> dict:
+    """Run one case; returns every read (token ids, number of options, in call order) and the outputs.
+    prefix_cache=False: the plain path (one forward pass per read), whatever the code's default. True: the shared-prefix
+    read for any shared part (prefix_min_tokens 1; distributions with share_prefix), and the record also holds each
+    prepared prefix length ("prefix") and every letter read ("letter_reads", with the prefix it was read against);
+    "reads" then holds the reads that went through the plain path."""
     old = os.environ.pop("CHON_REREAD", None)
     if case.get("env") is not None:
         os.environ["CHON_REREAD"] = case["env"]
+    cfg = {**case["cfg"], "prefix_cache": bool(prefix_cache)}
+    if prefix_cache:
+        cfg["prefix_min_tokens"] = 1
     try:
-        dm = DecisionModel(model, tok, dict(case["cfg"]), device="cpu")
+        dm = DecisionModel(model, tok, cfg, device="cpu")
     finally:
         os.environ.pop("CHON_REREAD", None)
         if old is not None:
@@ -132,6 +165,21 @@ def run_case(DecisionModel, model, tok, case: dict, deadline: float | None = Non
         return real(seqs, n_options, letter_ids)
     dm.raw_logits = recording
     out = {"reread": dm.reread}
+    if prefix_cache:
+        out["prefix"], out["letter_reads"] = [], []
+        real_prepare, real_logits = dm._prepare_prefix, dm._logits
+
+        def prepare(seqs, *a, **k):
+            n = real_prepare(seqs, *a, **k)
+            out["prefix"].append(int(n))
+            return n
+
+        def letters(seqs, n_options):
+            sp = dm._shared
+            out["letter_reads"].append({"ids": [list(map(int, s)) for s in seqs], "n_options": list(map(int, n_options)),
+                                        "prefix": sp.length if sp is not None else 0})
+            return real_logits(seqs, n_options)
+        dm._prepare_prefix, dm._logits = prepare, letters
     if case["call"] == "predict":
         if deadline is None:
             answers, usage = dm.predict(case["state"], case["questions"])
@@ -141,8 +189,9 @@ def run_case(DecisionModel, model, tok, case: dict, deadline: float | None = Non
         out.update(answers=answers, usage=usage)
     else:
         reqs = [(s, q, o) for s, q, o in case["requests"]]
+        kw = {"share_prefix": True} if prefix_cache else {}
         out["distributions"] = dm.distributions(reqs, calibrated=case["calibrated"],
-                                                group_states=case["group_states"])
+                                                group_states=case["group_states"], **kw)
         out["served_reads"] = [list(x) for x in dm.served_reads([(s, q) for s, q, _ in reqs])]
     out["reads"] = reads
     return out

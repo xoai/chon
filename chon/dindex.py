@@ -16,6 +16,14 @@ Engine settings for the board (its rules: no truncation, every option gets a pro
   layout (state_first, header, hybrid_header) and any second read of unsure answers are the model's own settings
   (chon_config.json "prompt_layout" / "reread"; $CHON_REREAD overrides the second read) and are stated in the run's
   provenance.
+
+Latency (the board lists a model only if its median, mean and 80th-percentile request time are each under 1 s on one
+RTX PRO 6000, 96 GB): the shared-prefix read is on by default (chon_config.json "prefix_cache", or
+--option prefix_cache=false to measure without it). The part every read of a request shares (template start, a header
+model's question list, the state) runs once; the questions then read their own tokens against it in packed passes,
+the group and final rounds of a choice over 16 options and second reads that start with the same prefix included. A
+request with k questions about a P-token state costs about P + k x (question tokens) instead of k x P, with the same
+answers (bf16 rounding). Memory bound: see README, "Shared-prefix read".
 """
 from __future__ import annotations
 
@@ -35,20 +43,27 @@ except ImportError:  # the kit is not installed: the helpers below still import
 class ChonEngine(Engine):
     name = "chon"
     latency = ("In-process request wall time, one request at a time: prompt construction and the forward passes "
-               "(one per question; two rounds for a choice with more than 16 options; one more for an unsure "
-               "answer when a second read is set); excludes model loading.")
+               "(with the shared-prefix read on, the default: the part all reads of the request share once, then "
+               "every question's own tokens in one packed pass; otherwise one pass per question; two rounds for a "
+               "choice with more than 16 options; one more for an unsure answer when a second read is set); "
+               "excludes model loading.")
 
     def __init__(self, model="ninhnv/chon-1.0-12b", device="cuda", think=False, max_state_tokens=32768,
-                 max_batch_tokens=32768, noul_commit=False, **options):
+                 max_batch_tokens=32768, noul_commit=False, prefix_cache=None, **options):
+        """prefix_cache: None = the model's setting (chon_config.json "prefix_cache", default on); true / false
+        overrides it. Options from the kit's --option key=value arrive as strings ("false" is off)."""
         super().__init__(**options)
         import torch
 
-        from chon.infer import DecisionModel
+        from chon.infer import DecisionModel, flag
 
+        think, noul_commit = flag(think), flag(noul_commit)
         self.dm = DecisionModel.load(model, device=device, think=None if think else False,
                                      max_batch_tokens=int(max_batch_tokens))
         self.dm.builder.max_state_tokens = int(max_state_tokens)
         self.dm.cfg["truncate"] = False
+        if prefix_cache is not None and str(prefix_cache).strip() != "":
+            self.dm.cfg["prefix_cache"] = flag(prefix_cache)
         if not noul_commit:
             self.dm.noul_commit = None
         self._cuda = str(device).startswith("cuda") and torch.cuda.is_available()
@@ -69,15 +84,21 @@ class ChonEngine(Engine):
                if rr["layout"] == "twice" else "") +(" and the two distributions are averaged" if rr["combine"] == "avg"
                            else " and the second read replaces the first")
             + "; choices over 16 options are read once. " if rr else "Every question is read once (no second read). ")
+        prefix_text = ("The tokens all reads of a request share (template start, question list, state) are run "
+                       "once per request and shared by its questions through the key/value cache, each question masked "
+                       "to the prefix and its own tokens (the group and final rounds and second reads that start with "
+                       "the same tokens included), so the answers equal separate passes. ")
         self.provenance = {
             "kind": "chon", "model": model, "think": bool(think), "max_state_tokens": int(max_state_tokens),
             "noul_commit": bool(noul_commit), "temperatures": self.dm.temperatures,
             "post_temperatures": self.dm.post_temperatures,
-            "prompt_layout": self.dm.layout, "reread": rr,
-            "policy": "One forward pass per question reading the option letters (A-P) after one fixed prompt "
+            "prompt_layout": self.dm.layout, "reread": rr, "prefix_cache": self.dm.prefix_cache,
+            "policy": "One read per question of the option letters (A-P) at the end of one fixed prompt "
                       f"(layout {self.dm.layout!r}: {layout_text}); "
                       "choices with more than 16 options are read in groups of at most 16, then a final round "
                       "between the group winners, P = P(group wins) x P(option | group). " + reread_text +
+                      (prefix_text if self.dm.prefix_cache else
+                       "Every read runs its whole prompt (no shared-prefix read). ") +
                       "A state over max_state_tokens is refused as unsupported (maximum context length), never "
                       "truncated."}
 

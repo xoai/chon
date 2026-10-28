@@ -62,6 +62,8 @@ Options:
 - `--reread BELOW[,LAYOUT[,MAX_TOKENS[,COMBINE]]]` (`CHON_REREAD`): a second read of unsure answers, e.g.
   `--reread 0.9` or `--reread 0.9,twice,2000,replace`; `--reread off` turns off a model's own setting. See
   [Prompt layout and second read](#prompt-layout-and-second-read).
+- `--prefix-cache on|off`: the shared-prefix read (default: the model's `chon_config.json` `"prefix_cache"`, else
+  on). See [Shared-prefix read](#shared-prefix-read).
 
 ### Prompt layout and second read
 
@@ -114,6 +116,52 @@ combined. Choices with more than 16 options and score questions are read once.
   questions were read twice. `/health` reports the layout, the setting and counts.
 - The letters are always read by the loaded model (transformers), so the second read works with every
   reasoning engine, vLLM included.
+
+### Shared-prefix read
+
+Since 1.3.0 the questions of one request share one read of their state. Every read of a request starts with the same
+tokens (the chat template's start, a header model's question list, the state); that part runs through the model
+once, and each question then reads only its own tokens (question, options, reply position) against the cached keys
+and values, all questions in one packed forward pass, each masked to the prefix and its own tokens. Each question
+sees exactly the tokens it sees in a separate pass, so the answers are the same up to floating-point rounding (bf16
+rounding on a GPU). A request with k questions about a P-token state costs about P + k x (question tokens) instead
+of k x P.
+
+It is on by default and used for a request's first reads, for second reads that start with the same tokens
+(`twice`, and `twice_header` for a header model) and for the group and final rounds of a choice with more than 16
+options. A request with one question (and no such choice), a shared part under `prefix_min_tokens`, `sandwich`
+second reads and the reads after reasoning go through the plain path (one forward pass per read). It needs a
+decoder whose layers are sliding-window or full attention (Gemma 4) with the `sdpa` (default) or `eager` attention;
+for any other model the server prints one line when it loads and reads every question plainly.
+
+```json
+"prefix_cache": true, "prefix_min_tokens": 128, "prefix_pack_tokens": 8192
+```
+
+- `prefix_cache`: `false` (or `--prefix-cache off`, or the Decision Index engine's `--option prefix_cache=false`)
+  turns it off. `usage.prefix_tokens` says how many tokens a request shared; `/health` reports whether it is on and
+  how often it was used.
+- `prefix_min_tokens`: a shorter shared part is not worth a separate pass.
+- `prefix_pack_tokens`: the most question tokens read in one packed pass (a longer question goes alone). For a prefix
+  over about 123,000 tokens the pack is made smaller so that its attention mask stays under 2^30 cells.
+
+**Memory, Gemma 4 31B in bf16 on one 96 GB card, a 50,000-token state with 20 questions.** The weights take about
+62 GB. The 31B has 50 sliding-window layers (16 key/value heads of 256, window 1,024) and 10 full-attention layers
+(4 key/value heads of 512; keys and values come from one projection but are cached as two tensors):
+
+| Part | Size |
+|---|---|
+| Kept keys/values, sliding layers: 50 x 1,023 positions x 16 KiB | 0.8 GB |
+| Kept keys/values, full layers: 10 x 50,000 positions x 8 KiB | 4.1 GB |
+| Prefix pass (once): the activations of one plain read of the prompt, the same as the plain path pays | about 12 GB |
+| Each packed pass of up to 8,192 question tokens: full-layer mask 8,192 x 58,192 (0.5 GB, about 1 GB as an attention bias), one full layer's prefix + question keys/values (0.5 GB), activations (about 1 GB) | about 3 GB |
+
+So the peak is about 80 GB (during the prefix pass), and about 70 GB while the questions are read: 20 questions of
+a few hundred tokens each fit one packed pass. A sliding layer keeps a copy of its last 1,023 prefix positions: kept
+as a view of the whole pass's keys and values (as transformers' cache does), the sliding layers would pin
+50 x 50,000 x 16 KiB = 41 GB and the request would not fit. These are computed sizes, not a measurement on that card;
+the bound assumes the `sdpa` attention (`eager` materialises the attention scores and needs far more for long
+states, in the plain path too).
 
 ### Faster reasoning (vLLM)
 
@@ -215,9 +263,11 @@ python -m decision_index pipeline --engine chon.dindex:ChonEngine --option model
     --out runs/chon-1.0-12b-fast
 ```
 
-The engine answers in one forward pass per question (that board's latency rule), refuses a state longer
-than 32,768 tokens as unsupported instead of truncating it, and reads choices with more than 16 options in
-groups. The model's prompt layout and second-read setting (above) apply, and the run's provenance states both.
+The engine answers each question in one read without reasoning (that board's latency rule: median, mean and 80th
+percentile under 1 s per request), refuses a state longer than 32,768 tokens as unsupported instead of truncating
+it, and reads choices with more than 16 options in groups. The shared-prefix read is on unless the model's config
+or `--option prefix_cache=false` turns it off; with it, a request's state is read once for all its questions. The
+model's prompt layout, second-read and shared-prefix settings (above) apply, and the run's provenance states them.
 `python -m chon.dindex shard` / `merge` split the suite so several runner processes can share GPUs.
 
 ## Tests
@@ -228,7 +278,9 @@ pip install -e ".[serve,dev]" && pytest
 
 `tests/test_parity.py` builds a tiny random Gemma 4 model on the CPU and checks that every read's token ids and
 every output probability equal golden values made with the training code (`tests/golden_parity.json`, written by
-`tests/make_golden.py`).
+`tests/make_golden.py`). `tests/test_prefix.py` checks the shared-prefix read: the same reads and probabilities
+as the training code's shared-prefix read (`tests/golden_prefix.json`, `make_golden.py --prefix`), and the plain
+path's probabilities within 1e-4, for every parity case and for states longer than the sliding window.
 
 ## Licence
 

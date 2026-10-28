@@ -20,6 +20,16 @@ read; or "sandwich") and the two distributions are averaged ("combine": "avg") o
 Skipped when the request's deadline leaves no time for it.
 
     "reread": {"below": 0.9, "layout": "twice", "max_tokens": 2000, "combine": "avg"}
+
+Shared-prefix read (config key "prefix_cache", default true; chon.prefix): the tokens every read of a request shares
+(the chat template's start, a header model's question list, the state) run through the model once, and each question
+reads only its own tokens against that cached prefix, all of them in one packed pass (at most "prefix_pack_tokens"
+suffix tokens per pass, default 8192). The answers equal separate passes (up to floating-point rounding). Used for a
+request's first reads, the second reads that start with the same prefix ("twice" / "twice_header") and the group and
+final rounds of a choice over 16 options; a request with one question (and no grouped choice), a shared part under
+"prefix_min_tokens" (default 128) or a model it does not support (printed once) reads plainly.
+
+    "prefix_cache": true, "prefix_min_tokens": 128, "prefix_pack_tokens": 8192
 """
 
 from __future__ import annotations
@@ -36,6 +46,7 @@ from .answers import format_answer
 from .modeling import (letter_logits, left_pad, load_causal_lm, load_tokenizer, read_model_config)
 import contextlib
 
+from .prefix import SharedPrefix, Unsupported, check_supported, common_prefix, pack_budget, packed_batches
 from .prompt import INLINE_PREFIX, INLINE_SUFFIX, REREAD_LAYOUTS, PromptBuilder, suffix_letter_ids
 from .schema import MAX_OPTIONS, CapacityError, ItemError, instructions_text, options_for, validate_item
 
@@ -102,6 +113,15 @@ def parse_reread(cfg_value: dict | None, env: str | None = None) -> dict | None:
         raise ValueError(f"unknown reread combine {rr['combine']!r} (one of {REREAD_COMBINE})")
     rr["below"], rr["max_tokens"], rr["types"] = float(rr["below"]), int(rr["max_tokens"]), list(rr["types"])
     return rr
+
+
+# what a shared-prefix read that a transformers version or model cannot run raises: the request reads plainly instead
+_PREFIX_FAILURES = (Unsupported, TypeError, AttributeError, NotImplementedError)
+
+
+def flag(v) -> bool:
+    """A setting that may arrive as a string ("true", "off", "0", ...) from a command line or engine option."""
+    return v if isinstance(v, bool) else str(v).strip().lower() in ("1", "true", "yes", "on")
 
 
 def _state_key(state: Any) -> str:
@@ -208,6 +228,17 @@ class DecisionModel:
         self._read_s = 0.15
         self._gen_spt: float | None = None
         self.deadline_stats = {"requests": 0, "skipped": 0, "shortened": 0, "cut": 0}
+        # shared-prefix read (cfg "prefix_cache", default on): the request's common prefix runs once per request; its
+        # keys/values live in self._shared for that request only. _prefix_off: the model cannot take it (plain from
+        # then on, said once)
+        self._shared: SharedPrefix | None = None
+        self._prefix_off = False
+        self.prefix_stats = {"requests": 0, "prefix_tokens": 0, "reads": 0}
+        if model is not None and self.prefix_cache:
+            try:
+                check_supported(model)
+            except Unsupported as e:
+                self._prefix_off_notice(e)
         if self.think:
             self.think.setdefault("budget", 512)
             self.think.setdefault("generator", "base")
@@ -265,6 +296,7 @@ class DecisionModel:
             if merge:
                 model = model.merge_and_unload()
         model.eval()
+        model.requires_grad_(False)   # reading only: weights that want gradients would make autograd keep activations
         if quantize == "fp8":
             from .quantize import fp8_quantize
 
@@ -340,6 +372,78 @@ class DecisionModel:
             for row, j in zip(logits, idx):
                 out[j] = row[: n_options[j]]
             i += n
+        return out  # type: ignore[return-value]
+
+    # ------------------------------------------------------------------ shared-prefix read
+    @property
+    def prefix_cache(self) -> bool:
+        """Whether the shared-prefix read is on (cfg "prefix_cache", default true) and the model can take it."""
+        return flag(self.cfg.get("prefix_cache", True)) and not self._prefix_off
+
+    def _prefix_off_notice(self, err) -> None:
+        self._prefix_off = True
+        self._shared = None
+        print(f"[prefix] shared-prefix read off for this model ({err}): every question reads its whole prompt",
+              flush=True)
+
+    def _prepare_prefix(self, seqs: Sequence[Sequence[int]], force: bool = False) -> int:
+        """Run the common prefix of seqs once (cfg "prefix_cache", or force). Returns its length (0 = plain path)."""
+        self._shared = None
+        if not (force or flag(self.cfg.get("prefix_cache", True))) or self._prefix_off or len(seqs) < 2 \
+                or self.model is None:
+            return 0
+        p = min(common_prefix(seqs), min(len(s) for s in seqs) - 1)  # every question keeps its reply position
+        if p < int(self.cfg.get("prefix_min_tokens", 128)):
+            return 0
+        try:
+            self._shared = SharedPrefix(self.model, seqs[0][:p], self.device)
+        except _PREFIX_FAILURES as e:
+            self._prefix_off_notice(e)
+            return 0
+        self.prefix_stats["requests"] += 1
+        self.prefix_stats["prefix_tokens"] += p
+        return p
+
+    def _logits(self, seqs: Sequence[Sequence[int]], n_options: Sequence[int]) -> list[list[float]]:
+        """Letter logits: from the shared prefix when one is prepared and starts every sequence, else raw_logits.
+        The suffixes go in packed passes of at most cfg "prefix_pack_tokens" tokens (chon.prefix.pack_budget)."""
+        sp = self._shared
+        if sp is None or not all(len(s) > sp.length and s[:sp.length] == sp.tokens for s in seqs):
+            return self.raw_logits(seqs, n_options)
+        sufs = [s[sp.length:] for s in seqs]
+        budget = pack_budget(int(self.cfg.get("prefix_pack_tokens", 8192)), sp.kept.get("full_attention", 0))
+        out: list[list[float] | None] = [None] * len(seqs)
+        try:
+            for idx in packed_batches([len(x) for x in sufs], budget):
+                rows = sp.letter_logits([sufs[i] for i in idx], self.letter_ids).cpu().tolist()
+                for i, row in zip(idx, rows):
+                    out[i] = row[: n_options[i]]
+        except _PREFIX_FAILURES as e:
+            self._prefix_off_notice(e)
+            return self.raw_logits(seqs, n_options)
+        self.prefix_stats["reads"] += len(seqs)
+        return out  # type: ignore[return-value]
+
+    def _grouped_logits(self, seqs, n_options, keys) -> list[list[float]]:
+        """Letter logits with the reads grouped by key (their state): each group of two or more through its shared
+        prefix, the rest (and any group whose prefix is too short or unsupported) in one plain batch."""
+        groups: dict[Any, list[int]] = {}
+        for i, k in enumerate(keys):
+            groups.setdefault(k, []).append(i)
+        out: list[list[float] | None] = [None] * len(seqs)
+        plain: list[int] = []
+        for idx in groups.values():
+            if len(idx) < 2 or not self._prepare_prefix([seqs[i] for i in idx], force=True):
+                plain.extend(idx)
+                continue
+            try:
+                for i, row in zip(idx, self._logits([seqs[i] for i in idx], [n_options[i] for i in idx])):
+                    out[i] = row
+            finally:
+                self._shared = None
+        if plain:
+            for i, row in zip(plain, self.raw_logits([seqs[i] for i in plain], [n_options[i] for i in plain])):
+                out[i] = row
         return out  # type: ignore[return-value]
 
     # ------------------------------------------------------------------ second read when unsure
@@ -544,12 +648,14 @@ class DecisionModel:
                 probs[i] = [py if j == y else 1.0 - py for j in range(len(order))]
 
     def distributions(self, requests: Sequence[tuple[Any, dict, Sequence[str] | None]],
-                      calibrated: bool = True, think: bool = True,
+                      calibrated: bool = True, think: bool = True, share_prefix: bool = False,
                       group_states: bool = True) -> list[dict[str, float]]:
         """requests: (state, question, option order or None). Returns label -> probability.
         group_states=False: every request is its own request (one question); by default the questions about one
         state are read as one request (a header model lists them all). The second read applies to calibrated reads
-        only (temperatures are fitted on single reads)."""
+        only (temperatures are fitted on single reads).
+        share_prefix: the first reads about one state go through the shared-prefix read (the state once, each
+        question masked to it), which equals separate passes; models it does not support read plainly."""
         seqs, orders, fitted, asked = [], [], [], []
         fitted_cache: dict[int, str] = {}
         asked_of: dict = {}
@@ -569,7 +675,8 @@ class DecisionModel:
                                     layout=self.layout_for(len(asked[-1] or [None])), asked=asked[-1]))
             orders.append(list(order))
             fitted.append(fitted_cache[key])
-        logits = self.raw_logits(seqs, [len(o) for o in orders])
+        n_opts = [len(o) for o in orders]
+        logits = self._grouped_logits(seqs, n_opts, fitted) if share_prefix else self.raw_logits(seqs, n_opts)
         qtypes = [q["type"] for _, q, _ in requests]
         probs = [softmax(lg, self.temperatures.get(qt, 1.0) if calibrated else 1.0) for lg, qt in zip(logits, qtypes)]
         if calibrated:
@@ -623,22 +730,27 @@ class DecisionModel:
         if deadline is not None:
             self.deadline_stats["requests"] += 1
         try:
+            seqs, orders = [], []
+            for n in normal:
+                q = questions[n]
+                order = [lab for lab, _ in options_for(q)]
+                seqs.append(self.encode(state, q, order, fitted_state=fitted))
+                orders.append(order)
+            plan = self._plan_many(state, many, fitted) if many else None
+            # the shared-prefix read: the part every first read (and first-round group read) of this request shares
+            shared = self._prepare_prefix(seqs + (plan[1] if plan else []))
+            if shared:
+                usage["prefix_tokens"] = shared
             if normal:
-                seqs, orders = [], []
-                for n in normal:
-                    q = questions[n]
-                    order = [lab for lab, _ in options_for(q)]
-                    seqs.append(self.encode(state, q, order, fitted_state=fitted))
-                    orders.append(order)
                 t_read = time.monotonic()
-                logits = self.raw_logits(seqs, [len(o) for o in orders])
+                logits = self._logits(seqs, [len(o) for o in orders])
                 self._read_s = 0.8 * self._read_s + 0.2 * (time.monotonic() - t_read)
                 qtypes = [questions[n]["type"] for n in normal]
                 probs = [softmax(lg, self.temperatures.get(qt, 1.0)) for lg, qt in zip(logits, qtypes)]
                 n_rr, rr_tokens = self._apply_reread(
                     qtypes, orders, seqs, probs,
                     lambda i, lay: self.encode(state, questions[normal[i]], orders[i], fitted_state=fitted, layout=lay),
-                    self.raw_logits)
+                    self._logits)
                 if n_rr:
                     usage["input_tokens"] += rr_tokens
                     usage["reread"] = n_rr
@@ -654,11 +766,12 @@ class DecisionModel:
                     usage["thought"] = n_thought
             else:
                 self.think_tokens = []
-            if many:
-                more, n_in = self._predict_many(state, many, fitted)
+            if plan:
+                more, n_in = self._finish_many(state, plan, fitted)
                 answers.update(more)
                 usage["input_tokens"] += n_in
-        finally:   # the layout, question list and deadline belong to this request only
+        finally:   # the prefix keys/values, layout, question list and deadline belong to this request only
+            self._shared = None
             self._req_layout = None
             self._req_asked = None
             self._deadline = None
@@ -666,10 +779,10 @@ class DecisionModel:
         return {n: answers[n] for n in names}, usage
 
     def _predict_many(self, state: Any, qs: dict[str, dict], fitted: str) -> tuple[dict, int]:
-        """Choices with more than MAX_OPTIONS options: each group of at most MAX_OPTIONS options is read as its own
-        question, then one final question between the group winners. P(option) = P(its group wins the final) x
-        P(option | its group), so every option gets a probability and they sum to 1. No thinking on these."""
-        t = self.temperatures.get("choice", 1.0)
+        return self._finish_many(state, self._plan_many(state, qs, fitted), fitted)
+
+    def _plan_many(self, state: Any, qs: dict[str, dict], fitted: str):
+        """Groups of at most MAX_OPTIONS options per big choice and the first-round sequences."""
         plan, seqs, owner = [], [], []
         for n, q in qs.items():
             opts = options_for(q)
@@ -680,14 +793,23 @@ class DecisionModel:
             for gi, grp in enumerate(groups):
                 seqs.append(self.encode(state, _subquestion(q, grp), [lab for lab, _ in grp], fitted_state=fitted))
                 owner.append((n, gi, len(grp)))
-        lg1 = self.raw_logits(seqs, [m for _, _, m in owner])
+        return plan, seqs, owner
+
+    def _finish_many(self, state: Any, planned, fitted: str) -> tuple[dict, int]:
+        """Choices with more than MAX_OPTIONS options: each group of at most MAX_OPTIONS options is read as its own
+        question, then one final question between the group winners. P(option) = P(its group wins the final) x
+        P(option | its group), so every option gets a probability and they sum to 1. No thinking on these. Both
+        rounds read through the request's shared prefix when one is prepared."""
+        t = self.temperatures.get("choice", 1.0)
+        plan, seqs, owner = planned
+        lg1 = self._logits(seqs, [m for _, _, m in owner])
         p1 = {(n, gi): softmax(lg, t) for (n, gi, _), lg in zip(owner, lg1)}
         seqs2, finals = [], []
         for n, q, groups in plan:
             winners = [grp[max(range(len(grp)), key=p1[(n, gi)].__getitem__)] for gi, grp in enumerate(groups)]
             finals.append(len(winners))
             seqs2.append(self.encode(state, _subquestion(q, winners), [lab for lab, _ in winners], fitted_state=fitted))
-        lg2 = self.raw_logits(seqs2, finals)
+        lg2 = self._logits(seqs2, finals)
         out = {}
         for (n, q, groups), lg in zip(plan, lg2):
             pg = softmax(lg, t)

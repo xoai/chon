@@ -15,6 +15,10 @@ unsure answer runs only with the time left, shortened or skipped to fit, and dro
 reply never waits past a client's time limit for a better answer.
 
 The prompt layout ("prompt_layout": state_first, header or hybrid_header) comes from the model's chon_config.json.
+
+Shared-prefix read (default on; the model's "prefix_cache", or --prefix-cache on|off): the part every read of a request
+shares (template start, question list, state) runs once and each question reads only its own tokens against it, with
+the same answers. /health reports whether it is on and how often it was used.
 """
 
 
@@ -43,7 +47,9 @@ def create_app(model, api_key: str | None = None, deadline_s: float = 0.0):
         return {"ok": True, "model": model.name, "deadline_s": deadline_s or None,
                 "deadline": dict(getattr(model, "deadline_stats", {}) or {}),
                 "prompt_layout": getattr(model, "layout", None), "reread": getattr(model, "reread", None),
-                "reread_stats": dict(getattr(model, "reread_stats", {}) or {})}
+                "reread_stats": dict(getattr(model, "reread_stats", {}) or {}),
+                "prefix_cache": getattr(model, "prefix_cache", None),
+                "prefix_stats": dict(getattr(model, "prefix_stats", {}) or {})}
 
     @app.get("/v1/models")
     def models():
@@ -100,6 +106,9 @@ def main(argv=None) -> None:
     ap.add_argument("--reread", default=None, metavar="BELOW[,LAYOUT[,MAX_TOKENS[,COMBINE]]]",
                     help="second read of unsure answers, e.g. 0.9 or 0.9,twice,2000,avg; off switches off the "
                          "model's own setting (default: $CHON_REREAD, else the model's chon_config.json)")
+    ap.add_argument("--prefix-cache", default=None, choices=["on", "off"],
+                    help="the shared-prefix read: a request's shared part (state, question list) read once for all its "
+                         "questions, same answers (default: the model's chon_config.json \"prefix_cache\", else on)")
     ap.add_argument("--host", default="0.0.0.0")
     ap.add_argument("--port", type=int, default=8000)
     args = ap.parse_args(argv)
@@ -113,6 +122,8 @@ def main(argv=None) -> None:
     think = False if args.no_think else (json.load(open(args.think)) if args.think else None)
     model = DecisionModel.load(args.model, adapter=args.adapter, device=args.device, dtype=args.dtype,
                                quantize=args.quantize, compile=args.compile, think=think)
+    if args.prefix_cache is not None:
+        model.cfg["prefix_cache"] = args.prefix_cache == "on"
     for kv in args.think_set:
         k, _, v = kv.partition("=")
         if model.think is not None:
@@ -120,11 +131,16 @@ def main(argv=None) -> None:
     print(f"[serve] {model.name} on {model.device}, prompt layout {model.layout}"
           + (f", reasoning engine {model.think.get('engine', 'hf')}" if model.think else ", no reasoning")
           + (f", second read below {model.reread['below']:g} ({model.reread['layout']}, {model.reread['combine']}, "
-             f"prompts up to {model.reread['max_tokens']} tokens)" if model.reread else ", no second read"),
+             f"prompts up to {model.reread['max_tokens']} tokens)" if model.reread else ", no second read")
+          + (", shared-prefix read on" if model.prefix_cache else ", shared-prefix read off"),
           flush=True)
     # warm-up so the first measured request is not a cold start; the reasoning path too (its first call compiles,
     # and its speed sets how many tokens a deadline allows)
     model.predict("warm-up", {"w": {"type": "noul", "instructions": "Is this a warm-up?"}})
+    if model.prefix_cache:   # the shared-prefix read too (two questions about a state long enough to share)
+        model.predict(" ".join(f"Warm-up record line {i}: nothing to decide." for i in range(40)),
+                      {"w": {"type": "noul", "instructions": "Is this a warm-up?"},
+                       "v": {"type": "noul", "instructions": "Is this record empty?"}})
     if model.think:
         warm = model.encode("Warm-up record: the order total is 120 and the limit is 100.",
                             {"type": "noul", "instructions": "Is the order within the limit?"}, ["yes", "no"])
