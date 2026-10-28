@@ -30,6 +30,22 @@ Other layouts (PromptBuilder.render `layout`; chosen by the model's chon_config.
     twice         the state-first prompt up to the options, "Read the request again:", then the whole
                   state-first prompt again (a second read of an unsure answer; "twice_header" for a header model)
     sandwich      the question, the state, the question again (another second-read layout)
+
+Prompt style "decider" (PromptBuilder `style`; chosen by chon_config.json "prompt_style", default "chon" as above):
+
+    (header only) Questions that will be asked about the context:
+                  - <instructions of every question of the request, in request order, duplicates kept>
+
+    Context:
+    <state; JSON with spaces, each element of an array of 8 or more numbered with "_index">
+
+    Question: <instructions>          ("Which answer fits the context?" for a yes/no question without any)
+    Options:
+    (A) <label>: <description>        (yes/no questions show (A) no, (B) yes)
+    (B) ...
+
+and the letter is read after "Answer: (" at the start of the reply. Layouts: state_first, header, and their second
+reads twice / twice_header (the whole user turn, "Read the same input again before answering:", then it again).
 """
 
 from __future__ import annotations
@@ -52,6 +68,57 @@ REREAD_LAYOUTS = ("twice", "sandwich")
 # "header": every question of the request listed first, then the state, then the question being read, so the state
 # is read knowing everything that will be asked about it. A header model's second read ("twice") is "twice_header".
 HEADER_LINE = "Questions that will be asked about this record:"
+# prompt style "decider": the chat layout of decider-ai 1.6.0 (Apache-2.0) as FlexDM v1.0 reads stock Gemma-4-31B (MIT,
+# github.com/1000luca/FlexDM): "Context:" + the state (JSON with spaces, the positions of long arrays written in),
+# "Question:", "Options:" with "(A) key: description" lines, and the letter read after "Answer: (" in the reply. Their
+# header list ("Questions that will be asked about the context:") and read-twice line are kept verbatim. A model trained
+# in a style is served in it (chon_config.json "prompt_style").
+PROMPT_STYLES = ("chon", "decider")
+DEC_HEADER = "Questions that will be asked about the context:"
+DEC_AGAIN = "\n\nRead the same input again before answering:\n"
+DEC_ANSWER = "Answer: ("
+DEC_NOUL_TEXT = "Which answer fits the context?"
+ANNOTATE_MIN = 8
+
+
+def annotate_indices(x: Any, min_len: int = ANNOTATE_MIN) -> Any:
+    """Each element's position written into arrays of min_len or more (decider style): a question naming records[47]
+    becomes a lookup, not a count."""
+    if isinstance(x, list):
+        if len(x) >= min_len:
+            return [{"_index": i, **annotate_indices(v, min_len)} if isinstance(v, dict)
+                    else {"_index": i, "value": annotate_indices(v, min_len)} for i, v in enumerate(x)]
+        return [annotate_indices(v, min_len) for v in x]
+    if isinstance(x, dict):
+        return {k: annotate_indices(v, min_len) for k, v in x.items()}
+    return x
+
+
+def decider_state_text(state: Any) -> str:
+    return state if isinstance(state, str) else json.dumps(annotate_indices(state), ensure_ascii=False)
+
+
+def _dec_txt(v: Any) -> str:
+    return v if isinstance(v, str) else json.dumps(v, ensure_ascii=False)
+
+
+def decider_question_text(question: dict, order: Sequence[str]) -> str:
+    """'Question: <instructions>\\nOptions:\\n(A) key: description ...' (a noul question's options are yes / no)."""
+    raw = question.get("instructions")
+    text = DEC_NOUL_TEXT if question.get("type") == "noul" and raw in (None, "") else _dec_txt(raw if raw is not None else "")
+    opts = dict(options_for(question))
+    hide = question.get("option_keys") == "hide"
+    lines = [f"Question: {text}", "Options:"]
+    for letter, label in zip(LETTERS, order):
+        desc = opts[label]
+        lines.append(f"({letter}) {desc}" if desc and hide else f"({letter}) {label}: {desc}" if desc else f"({letter}) {label}")
+    return "\n".join(lines)
+
+
+def decider_question_label(question: dict) -> str:
+    """The question as the decider header lists it: the instructions as written."""
+    raw = question.get("instructions")
+    return DEC_NOUL_TEXT if question.get("type") == "noul" and raw in (None, "") else _dec_txt(raw if raw is not None else "")
 
 
 def _is_message(x: Any) -> bool:
@@ -103,11 +170,14 @@ class PromptBuilder:
     """Builds token ids for (state, question, option order) and knows the letter token ids."""
 
     def __init__(self, tokenizer, max_state_tokens: int = 6000, chat_template_kwargs: dict | None = None,
-                 answer_prefix: str = ""):
+                 answer_prefix: str = "", style: str = "chon"):
+        if style not in PROMPT_STYLES:
+            raise ValueError(f"unknown prompt_style {style!r} (one of {PROMPT_STYLES})")
         self.tok = tokenizer
+        self.style = style
         self.max_state_tokens = int(max_state_tokens)
         self.chat_template_kwargs = {"enable_thinking": False} if chat_template_kwargs is None else dict(chat_template_kwargs)
-        self.answer_prefix = answer_prefix
+        self.answer_prefix = DEC_ANSWER if style == "decider" else answer_prefix
         if not getattr(tokenizer, "chat_template", None):
             raise ValueError("tokenizer has no chat template; use the instruct (-it) checkpoint's tokenizer")
         self.letter_ids = self._find_letter_ids()
@@ -118,11 +188,11 @@ class PromptBuilder:
 
     def fit_state(self, state: Any) -> tuple[str, bool]:
         """Render the state and cut it to max_state_tokens. Returns (text, truncated)."""
-        text = state_text(state)
+        text = decider_state_text(state) if self.style == "decider" else state_text(state)
         ids = self.tok(text, add_special_tokens=False)["input_ids"]
         if len(ids) <= self.max_state_tokens:
             return text, False
-        conv = conversation_of(state)
+        conv = conversation_of(state) if self.style == "chon" else None
         if conv is not None:  # keep the most recent turns
             kept: list[str] = []
             budget = self.max_state_tokens - self._n_tokens(TRUNC_CONV)
@@ -144,7 +214,10 @@ class PromptBuilder:
                asked: Sequence[str] | None = None) -> str:
         """layout "state_first" (the state, then the question block: siblings share the state as a prefix), "header"
         (the request's questions `asked`, each with its whitespace collapsed, then the state, then the question), or
-        a second-read layout: "twice", "sandwich" (REREAD_LAYOUTS) or "twice_header" (a header read, twice)."""
+        a second-read layout: "twice", "sandwich" (REREAD_LAYOUTS) or "twice_header" (a header read, twice).
+        The decider style has state_first, header, twice and twice_header (_render_decider)."""
+        if self.style == "decider":
+            return self._render_decider(state_txt, question, order, layout, asked)
         q = question_text(question, order)
         head = q[: -len(ANSWER_LINE)].rstrip("\n")
         if layout == "state_first":
@@ -164,11 +237,40 @@ class PromptBuilder:
                                             **self.chat_template_kwargs)
         return text + self.answer_prefix
 
+    def natural_order(self, question: dict) -> list[str]:
+        """The option order a request is read in: the criteria's, with yes/no questions shown as (A) no, (B) yes in the
+        decider style."""
+        labels = [lab for lab, _ in options_for(question)]
+        return labels[::-1] if self.style == "decider" and question.get("type") == "noul" else labels
+
+    def asked_list(self, questions: Sequence[dict]) -> list[str]:
+        """The header's list for a request's questions: chon style, the distinct instructions (whitespace collapsed
+        when rendered); decider style, every question's instructions as written (duplicates kept)."""
+        if self.style == "decider":
+            return [decider_question_label(q) for q in questions]
+        return list(dict.fromkeys(instructions_text(q) for q in questions))
+
+    def _render_decider(self, state_txt: str, question: dict, order: Sequence[str], layout: str,
+                        asked: Sequence[str] | None) -> str:
+        """The decider style: state_first, header, and their second reads (twice, twice_header)."""
+        if layout not in ("state_first", "header", "twice", "twice_header"):
+            raise ValueError(f"prompt_style 'decider' has no {layout!r} layout")
+        top = ""
+        if layout in ("header", "twice_header"):
+            lst = list(asked) if asked else [decider_question_label(question)]
+            top = DEC_HEADER + "\n" + "\n".join(f"- {a}" for a in lst) + "\n\n"
+        user = f"{top}Context:\n{state_txt}\n\n{decider_question_text(question, order)}"
+        if layout in ("twice", "twice_header"):
+            user = user + DEC_AGAIN + user
+        text = self.tok.apply_chat_template([{"role": "user", "content": user}], tokenize=False,
+                                            add_generation_prompt=True, **self.chat_template_kwargs)
+        return text + self.answer_prefix
+
     def encode(self, state: Any, question: dict, order: Sequence[str] | None = None,
                fitted_state: str | None = None, layout: str = "state_first",
                asked: Sequence[str] | None = None) -> list[int]:
         if order is None:
-            order = [lab for lab, _ in options_for(question)]
+            order = self.natural_order(question)
         if len(order) > len(self.letter_ids):
             raise ValueError(f"at most {len(self.letter_ids)} options")
         st = fitted_state if fitted_state is not None else self.fit_state(state)[0]

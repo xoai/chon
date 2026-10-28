@@ -13,9 +13,10 @@ Engine settings for the board (its rules: no truncation, every option gets a pro
   think=false (the board's latency rule: median, mean and p80 under 1 s per request), a long state limit with a
   capacity refusal ("maximum context length") instead of cutting, choices over 16 options read in groups of at most
   16 then a final round between the group winners, and no yes/no commit band (a JevBench-specific rule). The prompt
-  layout (state_first, header, hybrid_header) and any second read of unsure answers are the model's own settings
-  (chon_config.json "prompt_layout" / "reread"; $CHON_REREAD overrides the second read) and are stated in the run's
-  provenance.
+  layout (state_first, header, hybrid_header), the prompt style (chon, decider), whether the letters are read under
+  the final logit soft cap and any second read of unsure answers are the model's own settings (chon_config.json
+  "prompt_layout" / "prompt_style" / "uncap_logits" / "reread"; $CHON_REREAD overrides the second read) and are stated
+  in the run's provenance.
 
 Latency (the board lists a model only if its median, mean and 80th-percentile request time are each under 1 s on one
 RTX PRO 6000, 96 GB): the shared-prefix read is on by default (chon_config.json "prefix_cache", or
@@ -76,6 +77,16 @@ class ChonEngine(Engine):
                              "first (by its instructions, in request order), then the state, then the question and "
                              "its options; for a request with one, the state, then the question and its options",
         }[self.dm.layout]
+        if self.dm.style == "decider":
+            layout_text = layout_text.replace("distinct question", "question").replace(
+                "(by its instructions, in request order)", "(every question's instructions, in request order)")
+        style_text = {
+            "chon": "",
+            "decider": ("Prompt style 'decider': 'Context:' and the state (JSON with spaces, elements of arrays of 8 "
+                        "or more numbered with _index), 'Question:', 'Options:' with '(A) key: description' lines "
+                        "(yes/no as (A) no, (B) yes), the letter read after 'Answer: ('. "),
+        }[self.dm.style] + ("The letters are read with the model's final logit soft cap off. " if self.dm.uncapped
+                            else "")
         reread_text = (
             f"A choice or yes/no answer whose top calibrated probability is under {rr['below']:g}, in a prompt of at "
             f"most {rr['max_tokens']} tokens, is read a second time in the {rr['layout']!r} layout"
@@ -92,9 +103,10 @@ class ChonEngine(Engine):
             "kind": "chon", "model": model, "think": bool(think), "max_state_tokens": int(max_state_tokens),
             "noul_commit": bool(noul_commit), "temperatures": self.dm.temperatures,
             "post_temperatures": self.dm.post_temperatures,
-            "prompt_layout": self.dm.layout, "reread": rr, "prefix_cache": self.dm.prefix_cache,
+            "prompt_layout": self.dm.layout, "prompt_style": self.dm.style, "uncap_logits": self.dm.uncapped,
+            "reread": rr, "prefix_cache": self.dm.prefix_cache,
             "policy": "One read per question of the option letters (A-P) at the end of one fixed prompt "
-                      f"(layout {self.dm.layout!r}: {layout_text}); "
+                      f"(layout {self.dm.layout!r}: {layout_text}); " + style_text +
                       "choices with more than 16 options are read in groups of at most 16, then a final round "
                       "between the group winners, P = P(group wins) x P(option | group). " + reread_text +
                       (prefix_text if self.dm.prefix_cache else

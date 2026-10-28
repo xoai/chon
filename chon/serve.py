@@ -14,7 +14,8 @@ waiting for the GPU included. The one-pass answer is always computed and kept; a
 unsure answer runs only with the time left, shortened or skipped to fit, and dropped if the clock runs out, so a
 reply never waits past a client's time limit for a better answer.
 
-The prompt layout ("prompt_layout": state_first, header or hybrid_header) comes from the model's chon_config.json.
+The prompt layout ("prompt_layout": state_first, header or hybrid_header), the prompt style ("prompt_style": chon or
+decider) and "uncap_logits" come from the model's chon_config.json.
 
 Shared-prefix read (default on; the model's "prefix_cache", or --prefix-cache on|off): the part every read of a request
 shares (template start, question list, state) runs once and each question reads only its own tokens against it, with
@@ -46,7 +47,8 @@ def create_app(model, api_key: str | None = None, deadline_s: float = 0.0):
     def health():
         return {"ok": True, "model": model.name, "deadline_s": deadline_s or None,
                 "deadline": dict(getattr(model, "deadline_stats", {}) or {}),
-                "prompt_layout": getattr(model, "layout", None), "reread": getattr(model, "reread", None),
+                "prompt_layout": getattr(model, "layout", None), "prompt_style": getattr(model, "style", None),
+                "uncap_logits": getattr(model, "uncapped", None), "reread": getattr(model, "reread", None),
                 "reread_stats": dict(getattr(model, "reread_stats", {}) or {}),
                 "prefix_cache": getattr(model, "prefix_cache", None),
                 "prefix_stats": dict(getattr(model, "prefix_stats", {}) or {})}
@@ -129,6 +131,8 @@ def main(argv=None) -> None:
         if model.think is not None:
             model.think[k] = json.loads(v) if v[:1] in "[{0123456789" or v in ("true", "false", "null") else v
     print(f"[serve] {model.name} on {model.device}, prompt layout {model.layout}"
+          + (f", prompt style {model.style}" if model.style != "chon" else "")
+          + (", letters read without the final soft cap" if model.uncapped else "")
           + (f", reasoning engine {model.think.get('engine', 'hf')}" if model.think else ", no reasoning")
           + (f", second read below {model.reread['below']:g} ({model.reread['layout']}, {model.reread['combine']}, "
              f"prompts up to {model.reread['max_tokens']} tokens)" if model.reread else ", no second read")

@@ -127,3 +127,24 @@ def write_model_config(path: str, cfg: dict) -> None:
     os.makedirs(path, exist_ok=True)
     with open(os.path.join(path, CONFIG_NAME), "w", encoding="utf-8") as f:
         json.dump(cfg, f, indent=2, ensure_ascii=False)
+
+
+def _inner(model: nn.Module) -> nn.Module:
+    while hasattr(model, "module") and not hasattr(model, "config"):  # DDP and similar wrappers
+        model = model.module
+    return model
+
+
+def uncap_logits(model: nn.Module) -> bool:
+    """Turn off Gemma's final logit soft cap (cap * tanh(x / cap), cap 30 on the real checkpoints) so letters are read
+    from the logits under it: the cap squeezes every confident answer into the same narrow band below it. The top answer
+    does not change (tanh is monotone); the probabilities do. Returns whether the model had a cap. A model trained this
+    way says so in its chon_config.json ("uncap_logits": true) and is read the same way."""
+    found = False
+    cfgs = {id(c): c for c in [getattr(m, "config", None) for m in _inner(model).modules()] if hasattr(c, "to_dict")}
+    for cfg in cfgs.values():   # every config in the tree: the wrapper's, the text model's (PEFT included)
+        for c in (cfg, getattr(cfg, "text_config", None), cfg.get_text_config() if hasattr(cfg, "get_text_config") else None):
+            if c is not None and getattr(c, "final_logit_softcapping", None) is not None:
+                c.final_logit_softcapping = None
+                found = True
+    return found

@@ -13,6 +13,11 @@ Prompt layout (config key "prompt_layout"): "state_first" (default), "header" (e
 before the state; chon.prompt.HEADER_LINE) or "hybrid_header" (the header for a request with two or more distinct
 questions, state-first for one). Any other value is refused.
 
+Prompt style (config key "prompt_style"): "chon" (default) or "decider" (chon.prompt: "Context:" / "Question:" /
+"Options:" with "(A) key: description" lines, yes/no shown as (A) no, (B) yes, every question of the request listed in
+a header read, the letter read after "Answer: ("); "uncap_logits": true reads the letters with the model's final logit
+soft cap off (chon.modeling.uncap_logits). A model trained with either is read the same way; any other style is refused.
+
 Optional second read of unsure answers (config key "reread", or $CHON_REREAD="below,layout,max_tokens,combine"):
 a choice or yes/no question whose top calibrated probability is under "below", in a prompt of at most "max_tokens"
 tokens, is read again in a second-read layout ("twice": the request written out twice, "twice_header" for a header
@@ -43,12 +48,13 @@ from typing import Any, Sequence
 import torch
 
 from .answers import format_answer
-from .modeling import (letter_logits, left_pad, load_causal_lm, load_tokenizer, read_model_config)
+from .modeling import (letter_logits, left_pad, load_causal_lm, load_tokenizer, read_model_config,
+                       uncap_logits)
 import contextlib
 
 from .prefix import SharedPrefix, Unsupported, check_supported, common_prefix, pack_budget, packed_batches
-from .prompt import INLINE_PREFIX, INLINE_SUFFIX, REREAD_LAYOUTS, PromptBuilder, suffix_letter_ids
-from .schema import MAX_OPTIONS, CapacityError, ItemError, instructions_text, options_for, validate_item
+from .prompt import INLINE_PREFIX, INLINE_SUFFIX, PROMPT_STYLES, REREAD_LAYOUTS, PromptBuilder, suffix_letter_ids
+from .schema import MAX_OPTIONS, CapacityError, ItemError, options_for, validate_item
 
 PROMPT_LAYOUTS = ("state_first", "header", "hybrid_header")
 
@@ -191,9 +197,19 @@ class DecisionModel:
         self.cfg = cfg
         self.name = cfg.get("name", name)
         self.device = torch.device(device)
+        # prompt style the model was trained (or is read) in: "chon" (default) or "decider" (chon.prompt); refused
+        # otherwise, like an unknown layout
+        self.style = cfg.get("prompt_style") or "chon"
+        if self.style not in PROMPT_STYLES:
+            raise ValueError(f"unknown prompt_style {self.style!r} in the model config (one of {PROMPT_STYLES}); "
+                             f"this model needs a newer version of the chon serving code")
         self.builder = PromptBuilder(tokenizer, max_state_tokens=cfg.get("max_state_tokens", 6000),
                                      chat_template_kwargs=cfg.get("chat_template_kwargs"),
-                                     answer_prefix=cfg.get("answer_prefix", ""))
+                                     answer_prefix=cfg.get("answer_prefix", ""), style=self.style)
+        # "uncap_logits": the letters are read with the final logit soft cap off, as the model was trained
+        self.uncapped = bool(cfg.get("uncap_logits"))
+        if self.uncapped and model is not None:
+            uncap_logits(model)
         self.letter_ids = torch.tensor(self.builder.letter_ids, dtype=torch.long, device=self.device)
         # prompt layout the model was trained (or is read) with: "state_first" (default), "header" (the request's
         # questions listed before the state) or "hybrid_header" (the header for a request with two or more distinct
@@ -218,6 +234,9 @@ class DecisionModel:
         # (prompt.REREAD_LAYOUTS) and the two distributions are averaged (or the second kept: combine "replace").
         # Off unless the config has "reread" or $CHON_REREAD sets it; never for choices over 16 options.
         self.reread = parse_reread(cfg.get("reread"), os.environ.get("CHON_REREAD"))
+        if self.reread and self.style == "decider" and self.reread["layout"] != "twice":
+            # the decider style has no sandwich layout: refused here rather than when an unsure answer is read again
+            raise ValueError(f"prompt_style 'decider' has no {self.reread['layout']!r} second read (use 'twice')")
         self.reread_stats = {"questions": 0, "reread": 0, "extra_tokens": 0, "deadline_skipped": 0}
         self.think = dict(cfg["think"]) if cfg.get("think") else None
         self.think_tokens: list[int | None] = []
@@ -328,15 +347,15 @@ class DecisionModel:
 
     def served_reads(self, pairs: Sequence[tuple[Any, dict]]) -> list[tuple[str | None, list[str] | None]]:
         """(layout, asked) per (state, question), as distributions() reads them when they arrive together: every
-        question about the same state listed in the header (distinct instructions, in order). For offline reads that
+        question about the same state listed in the header (the style's list: chon, the distinct instructions in order;
+        decider, every question's instructions, duplicates kept). For offline reads that
         call encode() directly, so they match serving."""
         if self.layout not in ("header", "hybrid_header"):
             return [(None, None)] * len(pairs)
-        asked_of: dict = {}
+        qs_of: dict = {}
         for st, q in pairs:
-            lst = asked_of.setdefault(_state_key(st), [])
-            if instructions_text(q) not in lst:
-                lst.append(instructions_text(q))
+            qs_of.setdefault(_state_key(st), []).append(q)
+        asked_of = {k: self.builder.asked_list(v) for k, v in qs_of.items()}   # (the style's list)
         return [(self.layout_for(len(asked_of[_state_key(st)])), asked_of[_state_key(st)]) for st, _ in pairs]
 
     def encode(self, state: Any, question: dict, order: Sequence[str] | None = None,
@@ -350,7 +369,7 @@ class DecisionModel:
             layout = "twice_header"
         if layout in ("header", "twice_header"):
             return self.builder.encode(state, question, order=order, fitted_state=fitted_state, layout=layout,
-                                       asked=asked or self._req_asked or [instructions_text(question)])
+                                       asked=asked or self._req_asked or self.builder.asked_list([question]))
         return self.builder.encode(state, question, order=order, fitted_state=fitted_state, layout=layout)
 
     @torch.inference_mode()
@@ -660,13 +679,13 @@ class DecisionModel:
         fitted_cache: dict[int, str] = {}
         asked_of: dict = {}
         if self.layout in ("header", "hybrid_header"):  # every question asked about each state, in order, once each
+            qs_of: dict = {}
             for r, (state, question, _) in enumerate(requests):
-                lst = asked_of.setdefault(_state_key(state) if group_states else r, [])
-                if instructions_text(question) not in lst:
-                    lst.append(instructions_text(question))
+                qs_of.setdefault(_state_key(state) if group_states else r, []).append(question)
+            asked_of = {k: self.builder.asked_list(v) for k, v in qs_of.items()}   # (the style's list)
         for r, (state, question, order) in enumerate(requests):
             if order is None:
-                order = [lab for lab, _ in options_for(question)]
+                order = self.builder.natural_order(question)
             key = id(state)
             if key not in fitted_cache:
                 fitted_cache[key] = self.builder.fit_state(state)[0]
@@ -697,8 +716,9 @@ class DecisionModel:
         one-pass answers always stand; a second read or the reasoning of unsure answers runs only if it fits before it.
         A choice with more than MAX_OPTIONS options (up to MAX_OPTIONS ** 2) is read in groups, then a final round
         between the group winners (_predict_many). cfg "truncate": false refuses a state over max_state_tokens with
-        a CapacityError instead of cutting it. A header model lists the request's distinct questions (by their
-        instructions, in request order) in every read of this request, the groups and final rounds included."""
+        a CapacityError instead of cutting it. A header model lists the request's questions in every read of this
+        request, the groups and final rounds included: in the chon style the distinct instructions in request order,
+        in the decider style every question's instructions in request order (PromptBuilder.asked_list)."""
         if not isinstance(questions, dict) or not questions:
             raise ItemError("questions must be a non-empty object")
         names = list(questions)
@@ -718,12 +738,12 @@ class DecisionModel:
             raise CapacityError(f"the state is longer than {self.builder.max_state_tokens} tokens: maximum context "
                                 f"length exceeded (this model does not truncate)")
         normal = [n for n in names if n not in many]
-        asked_all = list(dict.fromkeys(instructions_text(questions[n]) for n in names))
+        asked_all = self.builder.asked_list([questions[n] for n in names])   # (the style's list)
         answers: dict[str, dict] = {}
         usage = {"input_tokens": 0, "output_tokens": 0, "forward_s": 0.0}
         t0 = time.perf_counter()
-        # hybrid_header counts distinct questions (two names with the same instructions are one question listed):
-        # every encode of this request (first reads, second reads, groups, finals) uses this layout and list
+        # hybrid_header counts the questions listed (chon style: two names with the same instructions are one question
+        # listed; decider style: every name is listed): every encode of this request (first reads, second reads, groups, finals) uses this layout and list
         self._req_layout = self.layout_for(len(asked_all) if self.layout == "hybrid_header" else len(names))
         self._req_asked = asked_all if self._req_layout == "header" else None
         self._deadline = deadline
@@ -733,7 +753,7 @@ class DecisionModel:
             seqs, orders = [], []
             for n in normal:
                 q = questions[n]
-                order = [lab for lab, _ in options_for(q)]
+                order = self.builder.natural_order(q)
                 seqs.append(self.encode(state, q, order, fitted_state=fitted))
                 orders.append(order)
             plan = self._plan_many(state, many, fitted) if many else None

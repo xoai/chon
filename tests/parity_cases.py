@@ -29,23 +29,29 @@ CONV_STATE = [{"role": "user", "content": "Mức độ 7, the box arrived damage
               {"role": "assistant", "content": "Đã ghi nhận."}]
 
 
-def _p(name, layout, questions, state=TEXT_STATE, reread=None, env=None, **cfg):
+def _p(name, layout, questions, state=TEXT_STATE, reread=None, env=None, softcap=None, **cfg):
     c = {"temperatures": TEMPS, **cfg}
     if layout is not None:
         c["prompt_layout"] = layout
     if reread is not None:
         c["reread"] = reread
-    return {"name": name, "call": "predict", "cfg": c, "env": env, "state": state, "questions": questions}
+    case = {"name": name, "call": "predict", "cfg": c, "env": env, "state": state, "questions": questions}
+    if softcap is not None:   # the model's final logit soft cap for this case (the tiny model has none)
+        case["softcap"] = softcap
+    return case
 
 
-def _d(name, layout, requests, reread=None, env=None, calibrated=True, group_states=True):
-    c = {"temperatures": TEMPS}
+def _d(name, layout, requests, reread=None, env=None, calibrated=True, group_states=True, softcap=None, **cfg):
+    c = {"temperatures": TEMPS, **cfg}
     if layout is not None:
         c["prompt_layout"] = layout
     if reread is not None:
         c["reread"] = reread
-    return {"name": name, "call": "distributions", "cfg": c, "env": env, "requests": requests,
+    case = {"name": name, "call": "distributions", "cfg": c, "env": env, "requests": requests,
             "calibrated": calibrated, "group_states": group_states}
+    if softcap is not None:
+        case["softcap"] = softcap
+    return case
 
 
 RR = {"below": 0.6, "layout": "twice", "max_tokens": 4000, "combine": "avg"}
@@ -113,6 +119,75 @@ CASES = [
 ]
 
 
+# ---- prompt style "decider" (1.4.0): "Context:" / "Question:" / "Options:" lines, yes/no read as (A) no, (B) yes, every
+# question listed in a header read (duplicates kept), JSON states with spaces and long arrays numbered, the letter read
+# after "Answer: (" (a config's own answer_prefix is overridden); and "uncap_logits" (the model's final soft cap off)
+DEC = {"prompt_style": "decider"}
+UNCAP = {"uncap_logits": True}
+CAP = 2.0   # a final logit soft cap for the tiny model (which has none): its letter logits are about 1-3
+BARE_NOUL = {"type": "noul", "instructions": "", "criteria": None}   # offline reads only (a request needs instructions)
+ARRAY_STATE = {"order": 77, "items": [{"sku": f"B{i}", "qty": i % 3} for i in range(9)], "scores": list(range(8)),
+               "seven": ["x"] * 7, "nested": {"rows": [[i, i + 1] for i in range(8)]}, "note": "Mức độ 3"}
+
+DECIDER_CASES = [
+    # first reads
+    _p("dec_state_first", None, {"route": ROUTE, "within": WITHIN, "severe": SEVERE, "team": DICT_INSTR}, **DEC),
+    _p("dec_state_first_json_array", "state_first", {"route": ROUTE, "within": WITHIN}, state=ARRAY_STATE,
+       noul_commit=[0.199, 0.801], answer_prefix="Answer:", **DEC),
+    _p("dec_state_first_conv", "state_first", {"severe": SEVERE, "within": WITHIN}, state=CONV_STATE, **DEC),
+    _p("dec_header_multi", "header", {"route": ROUTE, "within": WITHIN, "severe": SEVERE, "team": DICT_INSTR}, **DEC),
+    _p("dec_header_same_instructions", "header", {"a": ROUTE, "b": ROUTE_LIST, "within": WITHIN}, **DEC),
+    _p("dec_header_json_array", "header", {"route": ROUTE, "within": WITHIN, "severe": SEVERE}, state=ARRAY_STATE,
+       **DEC),
+    _p("dec_header_one", "header", {"within": WITHIN}, state=CONV_STATE, **DEC),
+    _p("dec_hybrid_one", "hybrid_header", {"within": WITHIN}, **DEC),
+    _p("dec_hybrid_same_instructions", "hybrid_header", {"a": ROUTE, "b": ROUTE_LIST}, **DEC),
+    _p("dec_header_many", "header", {"line": MANY, "wh": MANY_LIST, "within": WITHIN}, **DEC),
+    _p("dec_state_first_many", "state_first", {"line": MANY, "within": WITHIN}, state=ARRAY_STATE, **DEC),
+    # the second read: "twice", and "twice_header" for a header read
+    _p("dec_reread_header_avg", "header", {"route": ROUTE, "within": WITHIN, "severe": SEVERE}, reread=RR_ALL, **DEC),
+    _p("dec_reread_header_replace", "header", {"route": ROUTE, "within": WITHIN}, state=ARRAY_STATE,
+       reread={**RR_ALL, "combine": "replace"}, **DEC),
+    _p("dec_reread_header_threshold", "header", {"route": ROUTE, "within": WITHIN, "severe": SEVERE, "team": DICT_INSTR},
+       reread=RR, **DEC),
+    _p("dec_reread_state_first_avg", "state_first", {"route": ROUTE, "within": WITHIN, "team": DICT_INSTR},
+       reread=RR_ALL, **DEC),
+    _p("dec_reread_hybrid_one", "hybrid_header", {"within": WITHIN}, reread=RR_ALL, **DEC),
+    _p("dec_reread_hybrid_multi_replace", "hybrid_header", {"route": ROUTE, "within": WITHIN},
+       reread={**RR_ALL, "combine": "replace"}, **DEC),
+    _p("dec_reread_hybrid_same_instructions", "hybrid_header", {"a": ROUTE, "b": ROUTE_LIST}, reread=RR_ALL, **DEC),
+    _p("dec_reread_many", "header", {"line": MANY, "route": ROUTE, "within": WITHIN}, reread=RR_ALL, **DEC),
+    _p("dec_reread_max_tokens", "state_first", {"route": ROUTE, "within": WITHIN},
+       reread={**RR_ALL, "max_tokens": 110}, **DEC),
+    _p("dec_env_header_replace", "header", {"route": ROUTE, "within": WITHIN}, env="0.95,twice,,replace", **DEC),
+    _p("dec_env_over_config", "state_first", {"route": ROUTE, "within": WITHIN}, reread=RR, env="0.99", **DEC),
+    # uncapped letters: the same requests under a soft cap, read with it (capped) and without it (uncap_logits)
+    _p("dec_header_capped", "header", {"route": ROUTE, "within": WITHIN, "severe": SEVERE, "team": DICT_INSTR},
+       softcap=CAP, **DEC),
+    _p("dec_header_uncapped", "header", {"route": ROUTE, "within": WITHIN, "severe": SEVERE, "team": DICT_INSTR},
+       softcap=CAP, **DEC, **UNCAP),
+    _p("dec_reread_header_uncapped", "header", {"route": ROUTE, "within": WITHIN, "severe": SEVERE}, reread=RR_ALL,
+       softcap=CAP, **DEC, **UNCAP),
+    _p("chon_state_first_capped", None, {"route": ROUTE, "within": WITHIN, "severe": SEVERE}, softcap=CAP),
+    _p("chon_state_first_uncapped", None, {"route": ROUTE, "within": WITHIN, "severe": SEVERE}, softcap=CAP, **UNCAP),
+    # offline reads
+    _d("dec_dist_header", "header", [(TEXT_STATE, ROUTE, None), (ARRAY_STATE, WITHIN, None), (TEXT_STATE, SEVERE, None),
+                                     (ARRAY_STATE, ROUTE, ["close", "escalate", "replace", "refund"]),
+                                     (TEXT_STATE, BARE_NOUL, None), (ARRAY_STATE, WITHIN, ["yes", "no"])], **DEC),
+    _d("dec_dist_hybrid_reread", "hybrid_header", [(TEXT_STATE, ROUTE, None), (TEXT_STATE, ROUTE_LIST, None),
+                                                   (ARRAY_STATE, WITHIN, None), (CONV_STATE, BARE_NOUL, None)],
+       reread=RR_ALL, **DEC),
+    _d("dec_dist_state_first_uncapped", "state_first", [(TEXT_STATE, ROUTE, None), (ARRAY_STATE, WITHIN, None),
+                                                        (CONV_STATE, SEVERE, None)],
+       reread=RR_ALL, softcap=CAP, **DEC, **UNCAP),
+    _d("dec_dist_header_ungrouped", "header", [(TEXT_STATE, ROUTE, None), (TEXT_STATE, WITHIN, None)],
+       reread=RR_ALL, group_states=False, **DEC),
+    _d("dec_dist_uncalibrated", "header", [(TEXT_STATE, ROUTE, None), (TEXT_STATE, WITHIN, None)],
+       reread=RR_ALL, calibrated=False, **DEC),
+]
+CASES = CASES + DECIDER_CASES
+
+
 # ---- the shared-prefix read: every case above with it on, plus states longer than the tiny model's 64-token sliding
 # window (so the cached prefix crosses it) -----------------------------------------------------------------------------
 LONG_STATE = " ".join(f"Parcel {i} weighs {i % 7} kg and goes to depot {i % 3}." for i in range(30))
@@ -136,7 +211,34 @@ PREFIX_EXTRA = [
     _d("long_dist_state_first", "state_first", [(LONG_STATE, ROUTE, None), (LONG_STATE, WITHIN, None),
                                                 (LONG_STATE, SEVERE, None)], reread=RR_ALL),
 ]
+PREFIX_EXTRA += [   # the decider style, long states
+    _p("long_dec_state_first", "state_first", {"route": ROUTE, "within": WITHIN, "severe": SEVERE, "team": DICT_INSTR},
+       state=LONG_STATE, **DEC),
+    _p("long_dec_header_array", "header", {"route": ROUTE, "within": WITHIN, "severe": SEVERE}, state=LONG_JSON, **DEC),
+    _p("long_dec_header_many_reread", "header", {"line": MANY, "wh": MANY_LIST, "route": ROUTE, "within": WITHIN},
+       state=LONG_STATE, reread=RR_ALL, **DEC),
+    _p("long_dec_capped", "header", {"a": ROUTE, "b": ROUTE_LIST, "within": WITHIN}, state=LONG_JSON, softcap=CAP,
+       **DEC),
+    _p("long_dec_uncapped_reread", "header", {"a": ROUTE, "b": ROUTE_LIST, "within": WITHIN}, state=LONG_JSON,
+       reread={**RR_ALL, "combine": "replace"}, softcap=CAP, **DEC, **UNCAP),
+    _p("long_dec_hybrid_reread", "hybrid_header", {"route": ROUTE, "within": WITHIN}, state=LONG_STATE, reread=RR_ALL,
+       **DEC),
+    _d("long_dec_dist_header", "header", [(LONG_STATE, ROUTE, None), (LONG_STATE, WITHIN, None),
+                                          (LONG_JSON, SEVERE, None), (LONG_JSON, BARE_NOUL, None),
+                                          (TEXT_STATE, WITHIN, None)], **DEC),
+]
 PREFIX_CASES = CASES + PREFIX_EXTRA
+
+
+def _softcap_configs(model) -> list:
+    """Every config object in the model's tree that has a final logit soft cap setting (set or None)."""
+    seen = {}
+    for m in model.modules():
+        c = getattr(m, "config", None)
+        for cc in (c, getattr(c, "text_config", None)):
+            if cc is not None and hasattr(cc, "final_logit_softcapping"):
+                seen[id(cc)] = cc
+    return list(seen.values())
 
 
 def run_case(DecisionModel, model, tok, case: dict, deadline: float | None = None, prefix_cache: bool = False) -> dict:
@@ -144,7 +246,22 @@ def run_case(DecisionModel, model, tok, case: dict, deadline: float | None = Non
     prefix_cache=False: the plain path (one forward pass per read), whatever the code's default. True: the shared-prefix
     read for any shared part (prefix_min_tokens 1; distributions with share_prefix), and the record also holds each
     prepared prefix length ("prefix") and every letter read ("letter_reads", with the prefix it was read against);
-    "reads" then holds the reads that went through the plain path."""
+    "reads" then holds the reads that went through the plain path.
+    case["softcap"]: the model reads under this final logit soft cap for the case. The model's soft cap settings are
+    put back afterwards, so a case with "uncap_logits" (which turns the cap off on the shared model) leaves the next
+    case's model as it found it."""
+    saved = [(c, c.final_logit_softcapping) for c in _softcap_configs(model)]
+    if case.get("softcap") is not None:
+        for c, _ in saved:
+            c.final_logit_softcapping = float(case["softcap"])
+    try:
+        return _run_case(DecisionModel, model, tok, case, deadline, prefix_cache)
+    finally:
+        for c, v in saved:
+            c.final_logit_softcapping = v
+
+
+def _run_case(DecisionModel, model, tok, case: dict, deadline: float | None, prefix_cache: bool) -> dict:
     old = os.environ.pop("CHON_REREAD", None)
     if case.get("env") is not None:
         os.environ["CHON_REREAD"] = case["env"]

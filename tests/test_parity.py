@@ -13,7 +13,7 @@ import time
 
 import pytest
 
-from parity_cases import CASES, RR_ALL, ROUTE, TEXT_STATE, WITHIN, run_case
+from parity_cases import CAP, CASES, DEC, RR_ALL, ROUTE, SEVERE, TEXT_STATE, WITHIN, run_case
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 GOLDEN = json.load(open(os.path.join(HERE, "golden_parity.json"), encoding="utf-8"))
@@ -227,3 +227,164 @@ def test_dindex_provenance_states_layout_and_second_read(tiny_model_dir, tmp_pat
     (d / "chon_config.json").write_text("{}")
     p = ChonEngine(model=str(d), device="cpu").provenance
     assert p["prompt_layout"] == "state_first" and p["reread"] is None and "no second read" in p["policy"]
+
+
+# ---- prompt style "decider" and uncapped letters (1.4.0) ----------------------------------------------------------
+
+def test_decider_cases_cover_what_they_claim():
+    g = GOLDEN["cases"]
+    assert g["dec_reread_header_avg"]["usage"]["reread"] == 2 and g["dec_reread_header_threshold"]["usage"]["reread"] == 2
+    assert g["dec_reread_max_tokens"]["usage"]["reread"] == 1 and g["dec_env_header_replace"]["reread"]["combine"] == "replace"
+    assert [r["n_options"] for r in g["dec_header_many"]["reads"]][1] == [14, 14, 12, 10, 10]
+    # the decider list keeps duplicates: two questions with the same instructions make a hybrid model read the header
+    assert g["dec_dist_hybrid_reread"]["served_reads"][0] == ["header", [ROUTE["instructions"]] * 2]
+    assert g["dist_hybrid"]["served_reads"][3][0] == "state_first"   # (the chon style lists them once)
+    # uncap_logits: the capped read differs, the uncapped read is the read of a model without a cap
+    for capped, uncapped, plain in (("dec_header_capped", "dec_header_uncapped", "dec_header_multi"),
+                                    ("chon_state_first_capped", "chon_state_first_uncapped", "state_first_default")):
+        assert g[uncapped]["answers"] == g[plain]["answers"] and g[uncapped]["reads"] == g[plain]["reads"]
+        assert g[capped]["answers"] != g[plain]["answers"] and g[capped]["reads"] == g[plain]["reads"]
+    assert g["dec_reread_header_uncapped"]["answers"] == g["dec_reread_header_avg"]["answers"]
+
+
+def test_decider_prompts_read_as_documented(tiny_dm):
+    from chon.prompt import DEC_AGAIN, DEC_ANSWER, DEC_HEADER, DEC_NOUL_TEXT, HEADER_LINE
+
+    sf = [_decoded(tiny_dm, "dec_state_first", row=r) for r in range(4)]
+    assert all(x.endswith("<start_of_turn>model\n" + DEC_ANSWER) for x in sf)
+    assert "Context:\n" + TEXT_STATE + "\n\nQuestion: Which action" in sf[0] and DEC_HEADER not in sf[0]
+    assert "Options:\n(A) refund: the customer wants to refund\n(B) replace:" in sf[0]
+    assert "(A) no: weight > limit\n(B) yes: weight <= limit<end_of_turn>" in sf[1]        # yes/no as no, yes
+    assert "Question: " + SEVERE["instructions"] + "\nOptions:\n(A) 0: low" in sf[2]       # instructions as written
+    assert 'Question: {"task": "Pick  the  team", "note": "billing\\nor shipping"}\nOptions:\n(A) billing\n' in sf[3]
+    js = _decoded(tiny_dm, "dec_state_first_json_array")      # a config's answer_prefix gives way to "Answer: ("
+    assert js.endswith("model\n" + DEC_ANSWER) and '{"_index": 8, "sku": "B8", "qty": 2}' in js
+    assert '"scores": [{"_index": 0, "value": 0}' in js and '"seven": ["x", "x", "x", "x", "x", "x", "x"]' in js
+    assert '"rows": [{"_index": 0, "value": [0, 1]}' in js and "Mức độ 3" in js
+    assert '"content": "Mức độ 7, the box arrived damaged."' in _decoded(tiny_dm, "dec_state_first_conv")
+    hm = _decoded(tiny_dm, "dec_header_multi", row=1)
+    assert hm.startswith("<bos><start_of_turn>user\n" + DEC_HEADER + "\n- Which action does the ticket request?\n"
+                         "- Is the parcel within the limit?\n- " + SEVERE["instructions"] + "\n- {")
+    assert hm.index("\n\nContext:\n" + TEXT_STATE) < hm.index("Question: Is the parcel") and HEADER_LINE not in hm
+    same = _decoded(tiny_dm, "dec_header_same_instructions")
+    assert same.count("- Which action does the ticket request?") == 2
+    assert DEC_HEADER in _decoded(tiny_dm, "dec_hybrid_same_instructions")
+    assert DEC_HEADER not in _decoded(tiny_dm, "dec_hybrid_one")
+    tw = _decoded(tiny_dm, "dec_reread_header_avg", call=1)   # twice_header: the whole user turn, the line, again
+    first = tw.split(DEC_AGAIN)[0].split("user\n", 1)[1]
+    assert tw.count(DEC_HEADER) == 2 and tw.count(DEC_AGAIN) == 1 and tw.endswith(first + "<end_of_turn>\n"
+                                                                                  "<start_of_turn>model\n" + DEC_ANSWER)
+    tw1 = _decoded(tiny_dm, "dec_reread_hybrid_one", call=1)
+    assert DEC_HEADER not in tw1 and tw1.count("Context:") == 2 and tw1.count(DEC_AGAIN) == 1
+    bare = tiny_dm.tok.decode(GOLDEN["cases"]["dec_dist_header"]["reads"][0]["ids"][4])
+    assert "- " + DEC_NOUL_TEXT in bare and "Question: " + DEC_NOUL_TEXT + "\nOptions:\n(A) no\n(B) yes<end" in bare
+    yn = tiny_dm.tok.decode(GOLDEN["cases"]["dec_dist_header"]["reads"][0]["ids"][5])   # an explicit order stands
+    assert "(A) yes: weight <= limit\n(B) no:" in yn
+
+
+def test_no_style_keys_read_as_before(tiny_dm):
+    """A config without prompt_style / uncap_logits: the chon style, no answer prefix, the model's cap untouched."""
+    from chon.infer import DecisionModel
+    from parity_cases import _softcap_configs
+
+    caps = _softcap_configs(tiny_dm.model)
+    for c in caps:
+        c.final_logit_softcapping = CAP
+    try:
+        dm = DecisionModel(tiny_dm.model, tiny_dm.tok, {"prompt_layout": "header"}, device="cpu")
+        assert dm.style == "chon" and not dm.uncapped and dm.builder.answer_prefix == ""
+        assert all(c.final_logit_softcapping == CAP for c in caps)
+        assert dm.builder.natural_order(WITHIN) == ["yes", "no"]
+        assert dm.builder.asked_list([ROUTE, ROUTE, WITHIN]) == [ROUTE["instructions"], WITHIN["instructions"]]
+        dm = DecisionModel(tiny_dm.model, tiny_dm.tok, {**DEC, "uncap_logits": True}, device="cpu")
+        assert all(c.final_logit_softcapping is None for c in caps)
+        assert dm.builder.natural_order(WITHIN) == ["no", "yes"]
+        assert dm.builder.asked_list([ROUTE, ROUTE]) == [ROUTE["instructions"]] * 2
+    finally:
+        for c in caps:
+            c.final_logit_softcapping = None
+
+
+def test_uncap_logits_helper(tiny_dm):
+    from chon.modeling import uncap_logits
+    from parity_cases import _softcap_configs
+
+    caps = _softcap_configs(tiny_dm.model)
+    assert caps and not uncap_logits(tiny_dm.model)    # the tiny model has no cap: nothing to turn off
+    for c in caps:
+        c.final_logit_softcapping = 30.0
+    try:
+        assert uncap_logits(tiny_dm.model) and all(c.final_logit_softcapping is None for c in caps)
+    finally:
+        for c in caps:
+            c.final_logit_softcapping = None
+
+
+def test_unknown_style_and_sandwich_are_refused(tiny_dm, monkeypatch):
+    from chon.infer import DecisionModel
+    from chon.prompt import PromptBuilder
+
+    monkeypatch.delenv("CHON_REREAD", raising=False)
+    for bad in ("flexdm", "Decider"):
+        with pytest.raises(ValueError, match="unknown prompt_style"):
+            DecisionModel(tiny_dm.model, tiny_dm.tok, {"prompt_style": bad}, device="cpu")
+        with pytest.raises(ValueError, match="unknown prompt_style"):
+            PromptBuilder(tiny_dm.tok, style=bad)
+    with pytest.raises(ValueError, match="no 'sandwich' second read"):
+        DecisionModel(tiny_dm.model, tiny_dm.tok, {**DEC, "reread": {**RR_ALL, "layout": "sandwich"}}, device="cpu")
+    monkeypatch.setenv("CHON_REREAD", "0.9,sandwich")
+    with pytest.raises(ValueError, match="no 'sandwich' second read"):
+        DecisionModel(tiny_dm.model, tiny_dm.tok, dict(DEC), device="cpu")
+    assert DecisionModel(tiny_dm.model, tiny_dm.tok, {}, device="cpu").reread["layout"] == "sandwich"
+    with pytest.raises(ValueError, match="no 'sandwich' layout"):
+        PromptBuilder(tiny_dm.tok, style="decider").encode(TEXT_STATE, ROUTE, layout="sandwich")
+
+
+def test_decider_settings_load_from_the_model_folder(tiny_model_dir, tmp_path, monkeypatch):
+    """A model folder whose config.json has a final soft cap and whose chon_config.json sets prompt_style "decider" and
+    uncap_logits reads as the golden uncapped reads; without uncap_logits, as the golden capped reads."""
+    from chon.infer import DecisionModel
+
+    monkeypatch.delenv("CHON_REREAD", raising=False)
+    d = tmp_path / "pkg"
+    shutil.copytree(tiny_model_dir, d)
+    mc = json.loads((d / "config.json").read_text())
+    mc["text_config"]["final_logit_softcapping"] = CAP
+    (d / "config.json").write_text(json.dumps(mc))
+    for name, expect_cap in (("dec_header_uncapped", None), ("dec_header_capped", CAP)):
+        case = BY_NAME[name]
+        (d / "chon_config.json").write_text(json.dumps(case["cfg"]))
+        dm = DecisionModel.load(str(d), device="cpu", dtype="float32")
+        assert dm.style == "decider" and dm.layout == "header" and dm.uncapped == (expect_cap is None)
+        assert dm.model.config.get_text_config().final_logit_softcapping == expect_cap
+        seen = []
+        real = dm.raw_logits
+        dm.raw_logits = lambda seqs, n, letter_ids=None: (seen.append([list(s) for s in seqs]), real(seqs, n))[1]
+        dm.cfg["prefix_cache"] = False
+        answers, _ = dm.predict(case["state"], case["questions"])
+        want = GOLDEN["cases"][name]
+        assert seen == [r["ids"] for r in want["reads"]]
+        _same_outputs(answers, want["answers"], name)
+
+
+def test_dindex_and_health_state_the_style(tiny_model_dir, tmp_path, monkeypatch):
+    from fastapi.testclient import TestClient
+
+    from chon.dindex import ChonEngine
+    from chon.serve import create_app
+
+    monkeypatch.delenv("CHON_REREAD", raising=False)
+    d = tmp_path / "pkg"
+    shutil.copytree(tiny_model_dir, d)
+    (d / "chon_config.json").write_text(json.dumps({"prompt_style": "decider", "uncap_logits": True,
+                                                    "prompt_layout": "hybrid_header"}))
+    e = ChonEngine(model=str(d), device="cpu")
+    p = e.provenance
+    assert p["prompt_style"] == "decider" and p["uncap_logits"] is True
+    assert "'decider'" in p["policy"] and "soft cap off" in p["policy"] and "distinct" not in p["policy"]
+    h = TestClient(create_app(e.dm, None)).get("/health").json()
+    assert h["prompt_style"] == "decider" and h["uncap_logits"] is True
+    (d / "chon_config.json").write_text("{}")
+    p = ChonEngine(model=str(d), device="cpu").provenance
+    assert p["prompt_style"] == "chon" and p["uncap_logits"] is False
+    assert "decider" not in p["policy"] and "soft cap" not in p["policy"]

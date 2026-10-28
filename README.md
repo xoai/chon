@@ -117,6 +117,42 @@ combined. Choices with more than 16 options and score questions are read once.
 - The letters are always read by the loaded model (transformers), so the second read works with every
   reasoning engine, vLLM included.
 
+### Prompt style and uncapped letters
+
+Since 1.4.0 the server reads two more settings from a model's `chon_config.json`. **Version 1.3.0 and older ignore
+both** (they read every model in the chon style, under the model's soft cap), so serve a model that sets them with
+1.4.0 or newer.
+
+**`prompt_style`** is the prompt style the model was trained with: `"chon"` (the default, above) or `"decider"`, the
+chat layout of decider-ai 1.6.0 as FlexDM v1.0 reads Gemma 4:
+
+```
+Questions that will be asked about the context:      (header layouts only)
+- <instructions of question 1>
+- <instructions of question 2>
+
+Context:
+<state>
+
+Question: <instructions of the question being read>
+Options:
+(A) <label>: <description>
+(B) ...
+```
+
+and the letter is read after `Answer: (` at the start of the reply (a config's `answer_prefix` is ignored). JSON
+states are written with spaces, and each element of an array of 8 or more carries its position (`"_index"`); yes/no
+questions show `(A) no`, `(B) yes`; a yes/no question without instructions reads "Which answer fits the context?".
+The header lists every question of the request in request order, as written (two questions with the same
+instructions are listed twice, so `"hybrid_header"` counts them as two). The `"twice"` second read writes the whole
+request out twice with "Read the same input again before answering:" between the copies (the header included for a
+header read); `"sandwich"` has no decider form and is refused at load. Any other style is refused at load.
+
+**`"uncap_logits": true`** reads the letters with the model's final logit soft cap turned off (Gemma's
+`final_logit_softcapping`, `30 * tanh(x / 30)`), as such a model was trained: the top answer is the same, the
+probabilities are not. `/health` and the Decision Index provenance report both settings; a config without them
+reads exactly as in 1.3.0.
+
 ### Shared-prefix read
 
 Since 1.3.0 the questions of one request share one read of their state. Every read of a request starts with the same
@@ -267,7 +303,8 @@ The engine answers each question in one read without reasoning (that board's lat
 percentile under 1 s per request), refuses a state longer than 32,768 tokens as unsupported instead of truncating
 it, and reads choices with more than 16 options in groups. The shared-prefix read is on unless the model's config
 or `--option prefix_cache=false` turns it off; with it, a request's state is read once for all its questions. The
-model's prompt layout, second-read and shared-prefix settings (above) apply, and the run's provenance states them.
+model's prompt layout and style, uncapped letters, second-read and shared-prefix settings (above) apply, and the
+run's provenance states them.
 `python -m chon.dindex shard` / `merge` split the suite so several runner processes can share GPUs.
 
 ## Tests
@@ -280,7 +317,8 @@ pip install -e ".[serve,dev]" && pytest
 every output probability equal golden values made with the training code (`tests/golden_parity.json`, written by
 `tests/make_golden.py`). `tests/test_prefix.py` checks the shared-prefix read: the same reads and probabilities
 as the training code's shared-prefix read (`tests/golden_prefix.json`, `make_golden.py --prefix`), and the plain
-path's probabilities within 1e-4, for every parity case and for states longer than the sliding window.
+path's probabilities within 1e-4, for every parity case and for states longer than the sliding window. The
+cases cover both prompt styles, and uncapped letters on the tiny model given a soft cap.
 
 ## Licence
 
