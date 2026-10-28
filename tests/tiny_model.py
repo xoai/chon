@@ -7,6 +7,10 @@ letter distributions are far from uniform (a parity check on near-uniform distri
 
 Imports only `chon.prompt` / `chon.schema` (identical in the training and serving code), so tests/make_golden.py can
 build the same folder with the training repository first on the path.
+
+tiny_adapter() puts a small LoRA adapter (the release adapter's shape: rank 4 on the text decoder's projections, as the
+training code's chon.eval.smoke.tiny_adapter) on a copy of the tiny model, its weights drawn the same way (seeded by
+parameter name, not peft's initialiser), for the pair-read cases.
 """
 
 from __future__ import annotations
@@ -20,6 +24,9 @@ import zlib
 CHAT_TEMPLATE = ("{{ bos_token }}{% for m in messages %}<start_of_turn>{{ m['role'] }}\n{{ m['content'] }}"
                  "<end_of_turn>\n{% endfor %}{% if add_generation_prompt %}<start_of_turn>model\n{% endif %}")
 WEIGHT_STD = 0.5
+LORA_STD = 0.3    # the adapter moves the letter distributions clearly away from the base model's
+LORA_PROJ = ("q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj")
+NON_TEXT = ("vision", "audio", "multi_modal", "embed_vision", "embed_audio", "visual")
 
 
 def make_items(n: int, seed: int = 0, prefix: str = "t") -> list[dict]:
@@ -105,3 +112,45 @@ def fingerprint(model_dir: str) -> dict:
         h.update(k.encode())
         h.update(sd[k].to(torch.float32).contiguous().numpy().tobytes())
     return {"tokenizer": vocab, "weights": h.hexdigest()[:16]}
+
+
+def lora_targets(model) -> list[str]:
+    """Full names of the text decoder's projection layers (vision and audio towers left out), as the training code's
+    chon.core.modeling.lora_target_modules picks them."""
+    import torch
+
+    return [name for name, mod in model.named_modules()
+            if isinstance(mod, torch.nn.Linear) and name.rsplit(".", 1)[-1] in LORA_PROJ
+            and not any(x in name.lower() for x in NON_TEXT)]
+
+
+def tiny_adapter(model):
+    """A copy of `model` with a rank-4 LoRA adapter ("default") on lora_targets, unmerged (a peft PeftModel), its
+    weights drawn from generators seeded by each parameter's name. The model passed in is not changed."""
+    import copy
+
+    import torch
+    from peft import LoraConfig, get_peft_model
+
+    m = copy.deepcopy(model)
+    peft = get_peft_model(m, LoraConfig(r=4, lora_alpha=8, target_modules=lora_targets(m), init_lora_weights=False))
+    with torch.no_grad():
+        for name, p in sorted(peft.named_parameters()):
+            if "lora_" in name:
+                g = torch.Generator().manual_seed(zlib.crc32(name.encode()))
+                p.copy_(torch.randn(p.shape, generator=g, dtype=torch.float32).to(p.dtype) * LORA_STD)
+    peft.eval()
+    peft.requires_grad_(False)
+    return peft
+
+
+def adapter_fingerprint(peft) -> str:
+    """What the pair cases' golden values depend on besides the tiny model: the adapter's weights."""
+    import torch
+
+    h = hashlib.sha256()
+    for name, p in sorted(peft.named_parameters()):
+        if "lora_" in name:
+            h.update(name.encode())
+            h.update(p.detach().to(torch.float32).contiguous().numpy().tobytes())
+    return h.hexdigest()[:16]

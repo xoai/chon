@@ -6,6 +6,8 @@
 Runs with the training repository first on sys.path, so `chon` is the training package: it builds the tiny model
 (tests/tiny_model.py), runs every case of tests/parity_cases.py through chon.core.infer.DecisionModel and records each
 read's token ids and the outputs. The public tests compare against this file without needing the training code.
+Cases with "adapter" read the tiny model with the tiny LoRA adapter (tiny_model.tiny_adapter), unmerged; the adapter's
+weights are fingerprinted too ("fixture" / "adapter").
 --prefix runs tests/parity_cases.py's PREFIX_CASES with the training code's shared-prefix read on instead (its
 chon.core.prefix), recording each prepared prefix and letter read too (tests/golden_prefix.json).
 """
@@ -35,8 +37,8 @@ def main(argv=None):
     import transformers
 
     from chon.core.infer import DecisionModel   # the training package: fails here if the path is wrong
-    from parity_cases import CASES, PREFIX_CASES, run_case
-    from tiny_model import build_tiny_model, fingerprint
+    from parity_cases import CASES, PREFIX_CASES, adapter_model, run_case
+    from tiny_model import adapter_fingerprint, build_tiny_model, fingerprint
 
     torch.set_num_threads(1)
     with tempfile.TemporaryDirectory() as tmp:
@@ -45,6 +47,7 @@ def main(argv=None):
         results = {c["name"]: run_case(DecisionModel, base.model, base.tok, c, prefix_cache=a.prefix)
                    for c in (PREFIX_CASES if a.prefix else CASES)}
         fp = fingerprint(model_dir)
+        fp["adapter"] = adapter_fingerprint(adapter_model(base.model))
     commit = subprocess.run(["git", "-C", training, "rev-parse", "HEAD"], capture_output=True, text=True,
                             check=False).stdout.strip()
     dirty = bool(subprocess.run(["git", "-C", training, "status", "--porcelain", "--", "chon"], capture_output=True,

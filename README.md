@@ -107,7 +107,8 @@ combined. Choices with more than 16 options and score questions are read once.
 
 - `layout`: `"twice"` writes the whole request out twice (`... Read the request again: ...`) and reads the letter
   after the second copy; a header read is written out twice with its question list. `"sandwich"` is the question,
-  the state, then the question again.
+  the state, then the question again. `"reverse"` (since 1.5.0, below) is the first read's prompt with the options
+  in reverse order.
 - `combine`: `"avg"` averages the two distributions; `"replace"` keeps the second read.
 - `CHON_REREAD` (or `--reread`) overrides the config: `below[,layout[,max_tokens[,combine]]]`, an empty field keeps
   its value (`0.9,twice,,replace`), and `0` or `off` turns the second read off.
@@ -152,6 +153,54 @@ header read); `"sandwich"` has no decider form and is refused at load. Any other
 `final_logit_softcapping`, `30 * tanh(x / 30)`), as such a model was trained: the top answer is the same, the
 probabilities are not. `/health` and the Decision Index provenance report both settings; a config without them
 reads exactly as in 1.3.0.
+
+### Reverse-order second read
+
+Since 1.5.0 the second read can also be `"layout": "reverse"`: the unsure question is read again in the first read's
+prompt (its layout, question list and state, written once) with its options in reverse order, so the option shown
+first becomes the last one and the letters move with them. The second read's probabilities are mapped back to the
+options and combined as set (`"avg"` or `"replace"`), which averages out a preference for a position. A yes/no
+question is read with its two answers swapped (`(A) yes`, `(B) no` in the decider style).
+
+```json
+"reread": {"below": 1.01, "layout": "reverse", "max_tokens": 3000, "combine": "avg"}
+```
+
+or `CHON_REREAD="1.01,reverse,3000"` (`--reread 1.01,reverse,3000`). Everything else about the second read applies
+(the threshold, the prompt length limit, choices over 16 options and scores read once, skipped near the deadline),
+and it reads through the shared-prefix read like the first read, as its prompt starts with the same tokens. The
+decider style takes it (unlike `"sandwich"`). **Version 1.4.0 and older refuse `"reverse"`** at load as an unknown
+layout.
+
+### Pair read
+
+Since 1.5.0 a model's `chon_config.json` can ask for a **pair read**: every request is read twice in the same prompt,
+once with the model's LoRA adapter and once with the adapter switched off (the plain base model), and the two
+distributions are averaged: a trained adapter and the plain model it was trained on can each do best on different
+kinds of questions, and the pair read combines them.
+
+```json
+"pair": {"weight": 0.5, "temperatures": {"choice": 1.0, "noul": 1.0, "score": 1.0}}
+```
+
+- `weight`: the adapter read's share; the answer is `weight x adapter + (1 - weight) x base`, label by label
+  (default 0.5; `1` is a plain single read).
+- `temperatures`: the base read's own per-type temperatures (the adapter read keeps the config's `temperatures`);
+  missing types are 1.0.
+- Each read is calibrated with its own temperatures and gets its own second read if one is set (each decides by its
+  own probabilities which questions are unsure); choices over 16 options are read in groups in both. The final rules,
+  post-calibration (`post_temperatures`) and the yes/no commit band (`noul_commit`), run **once, on the average**,
+  never on either read.
+- The adapter must stay unmerged, so the model is loaded with it as a separate adapter (a release package with
+  `adapter_config.json` and `base_model`, or `--adapter`); a pair read of a merged model or a model without an adapter
+  is refused at load, and so is a pair read with `"think"`.
+- Cost: two reads per request (each through the shared-prefix read when it is on). With a deadline the adapter read
+  always comes first, and the base read runs only if the time left allows it; `usage.pair` says how many reads were
+  averaged (2, or 1 when only the adapter read fitted), and `usage.input_tokens` counts both. `/health`, the
+  server's start line and the Decision Index provenance report the setting (`"pair": null` when there is none).
+
+**Version 1.4.0 and older ignore `"pair"`** (they read the adapter alone, merged), so serve a model that sets it with
+1.5.0 or newer. A config without `"pair"` or `"reverse"` reads exactly as in 1.4.0.
 
 ### Shared-prefix read
 
@@ -303,8 +352,8 @@ The engine answers each question in one read without reasoning (that board's lat
 percentile under 1 s per request), refuses a state longer than 32,768 tokens as unsupported instead of truncating
 it, and reads choices with more than 16 options in groups. The shared-prefix read is on unless the model's config
 or `--option prefix_cache=false` turns it off; with it, a request's state is read once for all its questions. The
-model's prompt layout and style, uncapped letters, second-read and shared-prefix settings (above) apply, and the
-run's provenance states them.
+model's prompt layout and style, uncapped letters, second-read, pair-read and shared-prefix settings (above) apply,
+and the run's provenance states them.
 `python -m chon.dindex shard` / `merge` split the suite so several runner processes can share GPUs.
 
 ## Tests
@@ -318,7 +367,9 @@ every output probability equal golden values made with the training code (`tests
 `tests/make_golden.py`). `tests/test_prefix.py` checks the shared-prefix read: the same reads and probabilities
 as the training code's shared-prefix read (`tests/golden_prefix.json`, `make_golden.py --prefix`), and the plain
 path's probabilities within 1e-4, for every parity case and for states longer than the sliding window. The
-cases cover both prompt styles, and uncapped letters on the tiny model given a soft cap.
+cases cover both prompt styles, uncapped letters on the tiny model given a soft cap, the reverse second read, and
+the pair read on the tiny model with a tiny LoRA adapter (`tiny_model.tiny_adapter`, its weights seeded like the
+model's).
 
 ## Licence
 

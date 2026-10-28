@@ -15,7 +15,8 @@ unsure answer runs only with the time left, shortened or skipped to fit, and dro
 reply never waits past a client's time limit for a better answer.
 
 The prompt layout ("prompt_layout": state_first, header or hybrid_header), the prompt style ("prompt_style": chon or
-decider) and "uncap_logits" come from the model's chon_config.json.
+decider), "uncap_logits" and the pair read ("pair": every request read with the adapter and without it, averaged) come
+from the model's chon_config.json.
 
 Shared-prefix read (default on; the model's "prefix_cache", or --prefix-cache on|off): the part every read of a request
 shares (template start, question list, state) runs once and each question reads only its own tokens against it, with
@@ -48,7 +49,8 @@ def create_app(model, api_key: str | None = None, deadline_s: float = 0.0):
         return {"ok": True, "model": model.name, "deadline_s": deadline_s or None,
                 "deadline": dict(getattr(model, "deadline_stats", {}) or {}),
                 "prompt_layout": getattr(model, "layout", None), "prompt_style": getattr(model, "style", None),
-                "uncap_logits": getattr(model, "uncapped", None), "reread": getattr(model, "reread", None),
+                "uncap_logits": getattr(model, "uncapped", None), "pair": getattr(model, "pair", None),
+                "reread": getattr(model, "reread", None),
                 "reread_stats": dict(getattr(model, "reread_stats", {}) or {}),
                 "prefix_cache": getattr(model, "prefix_cache", None),
                 "prefix_stats": dict(getattr(model, "prefix_stats", {}) or {})}
@@ -106,8 +108,8 @@ def main(argv=None) -> None:
                     help="seconds from a request's arrival to its answer: the reasoning is shortened or skipped to "
                          "fit, the one-pass answer always stands (0 = no deadline; default 8, $CHON_DEADLINE_S)")
     ap.add_argument("--reread", default=None, metavar="BELOW[,LAYOUT[,MAX_TOKENS[,COMBINE]]]",
-                    help="second read of unsure answers, e.g. 0.9 or 0.9,twice,2000,avg; off switches off the "
-                         "model's own setting (default: $CHON_REREAD, else the model's chon_config.json)")
+                    help="second read of unsure answers, e.g. 0.9, 0.9,twice,2000,avg or 0.9,reverse; off switches "
+                         "off the model's own setting (default: $CHON_REREAD, else the model's chon_config.json)")
     ap.add_argument("--prefix-cache", default=None, choices=["on", "off"],
                     help="the shared-prefix read: a request's shared part (state, question list) read once for all its "
                          "questions, same answers (default: the model's chon_config.json \"prefix_cache\", else on)")
@@ -133,6 +135,7 @@ def main(argv=None) -> None:
     print(f"[serve] {model.name} on {model.device}, prompt layout {model.layout}"
           + (f", prompt style {model.style}" if model.style != "chon" else "")
           + (", letters read without the final soft cap" if model.uncapped else "")
+          + (f", pair read (adapter weight {model.pair['weight']:g})" if model.pair else "")
           + (f", reasoning engine {model.think.get('engine', 'hf')}" if model.think else ", no reasoning")
           + (f", second read below {model.reread['below']:g} ({model.reread['layout']}, {model.reread['combine']}, "
              f"prompts up to {model.reread['max_tokens']} tokens)" if model.reread else ", no second read")

@@ -1,7 +1,8 @@
 """Requests and model settings whose reads must match the training code token for token (tests/test_parity.py).
 
 run_case() takes the DecisionModel class as an argument and imports nothing from chon, so tests/make_golden.py runs
-the same cases against the training repository's chon.core.infer.DecisionModel.
+the same cases against the training repository's chon.core.infer.DecisionModel. A case with "adapter" reads the tiny
+model with the tiny LoRA adapter on it, unmerged (tests/tiny_model.py tiny_adapter; the pair read needs one).
 """
 
 from __future__ import annotations
@@ -29,7 +30,7 @@ CONV_STATE = [{"role": "user", "content": "Mức độ 7, the box arrived damage
               {"role": "assistant", "content": "Đã ghi nhận."}]
 
 
-def _p(name, layout, questions, state=TEXT_STATE, reread=None, env=None, softcap=None, **cfg):
+def _p(name, layout, questions, state=TEXT_STATE, reread=None, env=None, softcap=None, adapter=False, **cfg):
     c = {"temperatures": TEMPS, **cfg}
     if layout is not None:
         c["prompt_layout"] = layout
@@ -38,10 +39,13 @@ def _p(name, layout, questions, state=TEXT_STATE, reread=None, env=None, softcap
     case = {"name": name, "call": "predict", "cfg": c, "env": env, "state": state, "questions": questions}
     if softcap is not None:   # the model's final logit soft cap for this case (the tiny model has none)
         case["softcap"] = softcap
+    if adapter:   # read with the tiny LoRA adapter, unmerged
+        case["adapter"] = True
     return case
 
 
-def _d(name, layout, requests, reread=None, env=None, calibrated=True, group_states=True, softcap=None, **cfg):
+def _d(name, layout, requests, reread=None, env=None, calibrated=True, group_states=True, softcap=None, adapter=False,
+       **cfg):
     c = {"temperatures": TEMPS, **cfg}
     if layout is not None:
         c["prompt_layout"] = layout
@@ -51,6 +55,8 @@ def _d(name, layout, requests, reread=None, env=None, calibrated=True, group_sta
             "calibrated": calibrated, "group_states": group_states}
     if softcap is not None:
         case["softcap"] = softcap
+    if adapter:
+        case["adapter"] = True
     return case
 
 
@@ -188,6 +194,91 @@ DECIDER_CASES = [
 CASES = CASES + DECIDER_CASES
 
 
+# ---- the "reverse" second read (1.5.0): the first read's prompt (its layout and question list) with the options in
+# reverse order, mapped back to the options, then averaged in or put in place of the first read
+RRV = {**RR_ALL, "layout": "reverse"}
+RRV_REPLACE = {**RRV, "combine": "replace"}
+
+REVERSE_CASES = [
+    _p("rev_state_first_avg", None, {"route": ROUTE, "within": WITHIN, "severe": SEVERE}, reread=RRV),
+    _p("rev_state_first_replace", "state_first", {"route": ROUTE, "within": WITHIN, "team": DICT_INSTR},
+       state=JSON_STATE, reread=RRV_REPLACE),
+    _p("rev_state_first_threshold", "state_first", {"route": ROUTE, "within": WITHIN, "team": DICT_INSTR},
+       state=JSON_STATE, reread={**RR, "layout": "reverse"}),
+    _p("rev_header_avg", "header", {"route": ROUTE, "within": WITHIN, "severe": SEVERE, "team": DICT_INSTR}, reread=RRV),
+    _p("rev_header_replace", "header", {"route": ROUTE, "within": WITHIN}, state=CONV_STATE, reread=RRV_REPLACE),
+    _p("rev_hybrid_one", "hybrid_header", {"within": WITHIN}, reread=RRV),
+    _p("rev_hybrid_multi_replace", "hybrid_header", {"route": ROUTE, "within": WITHIN}, reread=RRV_REPLACE),
+    _p("rev_many", "header", {"line": MANY, "route": ROUTE, "within": WITHIN}, reread=RRV),
+    _p("rev_max_tokens", "state_first", {"route": ROUTE, "within": WITHIN}, reread={**RRV, "max_tokens": 90}),
+    _p("rev_env_header", "header", {"route": ROUTE, "within": WITHIN}, env="1.01,reverse,3000"),
+    _p("rev_env_over_config", "state_first", {"route": ROUTE, "within": WITHIN}, reread=RR, env="1.01,reverse,,replace"),
+    _p("rev_dec_state_first_avg", "state_first", {"route": ROUTE, "within": WITHIN, "severe": SEVERE,
+                                                  "team": DICT_INSTR}, reread=RRV, **DEC),
+    _p("rev_dec_header_replace", "header", {"route": ROUTE, "within": WITHIN, "severe": SEVERE}, state=ARRAY_STATE,
+       reread=RRV_REPLACE, **DEC),
+    _p("rev_dec_header_avg", "header", {"route": ROUTE, "within": WITHIN}, reread=RRV, **DEC),
+    _p("rev_dec_state_first_replace", "state_first", {"within": WITHIN, "team": DICT_INSTR}, state=CONV_STATE,
+       reread=RRV_REPLACE, **DEC),
+    _p("rev_dec_hybrid_same_instructions", "hybrid_header", {"a": ROUTE, "b": ROUTE_LIST}, reread=RRV, **DEC),
+    _d("rev_dist_header", "header", [(TEXT_STATE, ROUTE, None), (JSON_STATE, WITHIN, None), (TEXT_STATE, SEVERE, None),
+                                     (JSON_STATE, ROUTE, ["close", "escalate", "replace", "refund"])], reread=RRV),
+    _d("rev_dist_state_first_ungrouped", "state_first", [(TEXT_STATE, ROUTE, None), (JSON_STATE, WITHIN, ["no", "yes"])],
+       reread=RRV_REPLACE, group_states=False),
+    _d("rev_dist_dec_hybrid_replace", "hybrid_header", [(TEXT_STATE, ROUTE, None), (TEXT_STATE, ROUTE_LIST, None),
+                                                        (ARRAY_STATE, WITHIN, None), (CONV_STATE, BARE_NOUL, None),
+                                                        (ARRAY_STATE, WITHIN, ["yes", "no"])],
+       reread=RRV_REPLACE, **DEC),
+]
+CASES = CASES + REVERSE_CASES
+
+
+# ---- the pair read (1.5.0): every request read with the adapter (TEMPS) and with it switched off (PAIR_T), each read
+# second-read as set, averaged (weight x adapter + (1 - weight) x base), then post-calibration and the yes/no commit band
+# once on the average. "adapter_alone" and "base_alone" are the two members read on their own.
+PAIR_T = {"choice": 0.9, "noul": 1.2, "score": 0.7}
+PAIR = {"pair": {"weight": 0.5, "temperatures": PAIR_T}}
+PAIR25 = {"pair": {"weight": 0.25, "temperatures": PAIR_T}}
+COMMIT = {"noul_commit": [0.199, 0.801]}
+TRIO = {"route": ROUTE, "within": WITHIN, "severe": SEVERE}
+
+PAIR_CASES = [
+    _p("adapter_alone", None, TRIO, adapter=True),
+    _p("base_alone", None, TRIO, temperatures=PAIR_T),
+    _p("pair_w50", None, TRIO, adapter=True, **PAIR),
+    _p("pair_w25", None, TRIO, adapter=True, **PAIR25),
+    _p("pair_weight_one", None, TRIO, adapter=True, pair={"weight": 1.0, "temperatures": PAIR_T}),
+    _p("pair_default_temperatures", None, TRIO, adapter=True, pair={"weight": 0.5}),
+    _p("pair_noul_commit", None, TRIO, adapter=True, **PAIR, **COMMIT),
+    _p("pair_post_temperatures", None, TRIO, adapter=True, post_temperatures={"choice": 0.7, "noul": 1.5}, **PAIR),
+    _p("pair_header", "header", {**TRIO, "team": DICT_INSTR}, adapter=True, **PAIR),
+    _p("pair_dec_header", "header", {**TRIO, "team": DICT_INSTR}, adapter=True, **PAIR, **DEC),
+    _p("pair_dec_hybrid_one", "hybrid_header", {"within": WITHIN}, state=CONV_STATE, adapter=True, **PAIR25, **DEC),
+    _p("pair_dec_state_first_commit", "state_first", {"route": ROUTE, "within": WITHIN}, state=ARRAY_STATE,
+       adapter=True, **PAIR25, **COMMIT, **DEC),
+    _p("pair_reread_twice", "header", TRIO, reread=RR_ALL, adapter=True, **PAIR),
+    _p("pair_reread_threshold", "state_first", {"route": ROUTE, "within": WITHIN, "team": DICT_INSTR}, state=JSON_STATE,
+       reread=RR, adapter=True, **PAIR),
+    _p("pair_dec_reread_twice_replace", "header", TRIO, reread={**RR_ALL, "combine": "replace"}, adapter=True,
+       **PAIR25, **DEC),
+    _p("pair_reverse", "header", TRIO, reread=RRV, adapter=True, **PAIR),
+    _p("pair_dec_reverse_replace", "state_first", {"route": ROUTE, "within": WITHIN, "team": DICT_INSTR},
+       reread=RRV_REPLACE, adapter=True, **PAIR25, **DEC),
+    _p("pair_env_reverse_commit", "header", {"route": ROUTE, "within": WITHIN}, env="1.01,reverse,3000", adapter=True,
+       **PAIR, **COMMIT),
+    _p("pair_many", "header", {"line": MANY, "within": WITHIN}, adapter=True, **PAIR),
+    _d("pair_dist_header_reverse", "header", [(TEXT_STATE, ROUTE, None), (JSON_STATE, WITHIN, None),
+                                              (TEXT_STATE, SEVERE, None), (JSON_STATE, ROUTE, ["close", "refund"])],
+       reread=RRV, adapter=True, **PAIR),
+    _d("pair_dist_dec_twice_commit", "hybrid_header", [(TEXT_STATE, ROUTE, None), (TEXT_STATE, WITHIN, None),
+                                                       (CONV_STATE, WITHIN, None)],
+       reread=RR_ALL, adapter=True, **PAIR25, **COMMIT, **DEC),
+    _d("pair_dist_uncalibrated", "header", [(TEXT_STATE, ROUTE, None), (TEXT_STATE, WITHIN, None)], reread=RR_ALL,
+       calibrated=False, adapter=True, **PAIR),
+]
+CASES = CASES + PAIR_CASES
+
+
 # ---- the shared-prefix read: every case above with it on, plus states longer than the tiny model's 64-token sliding
 # window (so the cached prefix crosses it) -----------------------------------------------------------------------------
 LONG_STATE = " ".join(f"Parcel {i} weighs {i % 7} kg and goes to depot {i % 3}." for i in range(30))
@@ -227,7 +318,32 @@ PREFIX_EXTRA += [   # the decider style, long states
                                           (LONG_JSON, SEVERE, None), (LONG_JSON, BARE_NOUL, None),
                                           (TEXT_STATE, WITHIN, None)], **DEC),
 ]
+PREFIX_EXTRA += [   # the reverse second read and the pair read, long states
+    _p("long_rev_header", "header", {"route": ROUTE, "within": WITHIN, "severe": SEVERE}, state=LONG_STATE, reread=RRV),
+    _p("long_rev_dec_state_first_replace", "state_first", {"route": ROUTE, "within": WITHIN, "team": DICT_INSTR},
+       state=LONG_JSON, reread=RRV_REPLACE, **DEC),
+    _p("long_pair_header_reread", "header", TRIO, state=LONG_STATE, reread=RR_ALL, adapter=True, **PAIR),
+    _p("long_pair_dec_reverse", "header", {"a": ROUTE, "b": ROUTE_LIST, "within": WITHIN}, state=LONG_JSON,
+       reread=RRV, adapter=True, **PAIR25, **DEC),
+    _p("long_pair_many_commit", "state_first", {"line": MANY, "route": ROUTE, "within": WITHIN}, state=LONG_STATE,
+       adapter=True, **PAIR, **COMMIT),
+    _d("long_pair_dist_header", "header", [(LONG_STATE, ROUTE, None), (LONG_STATE, WITHIN, None),
+                                           (LONG_JSON, SEVERE, None), (TEXT_STATE, WITHIN, None)],
+       reread=RRV, adapter=True, **PAIR),
+]
 PREFIX_CASES = CASES + PREFIX_EXTRA
+
+_ADAPTED: dict = {}
+
+
+def adapter_model(model):
+    """The tiny model with the tiny LoRA adapter on a copy of it (tests/tiny_model.py tiny_adapter), made once per
+    model (the model itself is left as it is)."""
+    if id(model) not in _ADAPTED:
+        from tiny_model import tiny_adapter
+
+        _ADAPTED[id(model)] = (model, tiny_adapter(model))
+    return _ADAPTED[id(model)][1]
 
 
 def _softcap_configs(model) -> list:
@@ -249,7 +365,10 @@ def run_case(DecisionModel, model, tok, case: dict, deadline: float | None = Non
     "reads" then holds the reads that went through the plain path.
     case["softcap"]: the model reads under this final logit soft cap for the case. The model's soft cap settings are
     put back afterwards, so a case with "uncap_logits" (which turns the cap off on the shared model) leaves the next
-    case's model as it found it."""
+    case's model as it found it.
+    case["adapter"]: the case reads adapter_model(model) (unmerged LoRA) instead of the model."""
+    if case.get("adapter"):
+        model = adapter_model(model)
     saved = [(c, c.final_logit_softcapping) for c in _softcap_configs(model)]
     if case.get("softcap") is not None:
         for c, _ in saved:

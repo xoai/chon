@@ -21,10 +21,19 @@ soft cap off (chon.modeling.uncap_logits). A model trained with either is read t
 Optional second read of unsure answers (config key "reread", or $CHON_REREAD="below,layout,max_tokens,combine"):
 a choice or yes/no question whose top calibrated probability is under "below", in a prompt of at most "max_tokens"
 tokens, is read again in a second-read layout ("twice": the request written out twice, "twice_header" for a header
-read; or "sandwich") and the two distributions are averaged ("combine": "avg") or the second kept ("replace").
-Skipped when the request's deadline leaves no time for it.
+read; or "sandwich"; or "reverse": the first read's prompt with the options in reverse order, mapped back to the
+options) and the two distributions are averaged ("combine": "avg") or the second kept ("replace"). Skipped when the
+request's deadline leaves no time for it.
 
     "reread": {"below": 0.9, "layout": "twice", "max_tokens": 2000, "combine": "avg"}
+
+Optional pair read (config key "pair"; needs an adapter, loaded unmerged): every request is read twice, with the adapter
+and with it switched off (the base model in the same prompt), each read calibrated with its own temperatures (the base
+read's in "temperatures") and second-read as configured, then averaged (weight x adapter + (1 - weight) x base) before
+the final rules (post-calibration, the yes/no commit band) run once on the average. A deadline that leaves no time for
+the base read keeps the adapter read. Not with "think".
+
+    "pair": {"weight": 0.5, "temperatures": {"choice": 1.0, "noul": 1.0, "score": 1.0}}
 
 Shared-prefix read (config key "prefix_cache", default true; chon.prefix): the tokens every read of a request shares
 (the chat template's start, a header model's question list, the state) run through the model once, and each question
@@ -89,6 +98,9 @@ def softmax(xs: Sequence[float], temperature: float = 1.0) -> list[float]:
 
 REREAD_DEFAULTS = {"below": 0.9, "layout": "twice", "max_tokens": 2000, "types": ["choice", "noul"], "combine": "avg"}
 REREAD_COMBINE = ("avg", "replace")   # average the two reads, or keep the second
+# "reverse": the second read is the first read's prompt with the options in reverse order (position bias averaged out),
+# mapped back to the options before it is combined
+REREAD_ORDERS = ("reverse",)
 
 
 def parse_reread(cfg_value: dict | None, env: str | None = None) -> dict | None:
@@ -113,12 +125,28 @@ def parse_reread(cfg_value: dict | None, env: str | None = None) -> dict | None:
             rr["combine"] = parts[3]
     if rr is None:
         return None
-    if rr["layout"] not in REREAD_LAYOUTS:
-        raise ValueError(f"unknown reread layout {rr['layout']!r} (one of {REREAD_LAYOUTS})")
+    if rr["layout"] not in REREAD_LAYOUTS + REREAD_ORDERS:
+        raise ValueError(f"unknown reread layout {rr['layout']!r} (one of {REREAD_LAYOUTS + REREAD_ORDERS})")
     if rr["combine"] not in REREAD_COMBINE:
         raise ValueError(f"unknown reread combine {rr['combine']!r} (one of {REREAD_COMBINE})")
     rr["below"], rr["max_tokens"], rr["types"] = float(rr["below"]), int(rr["max_tokens"]), list(rr["types"])
     return rr
+
+
+def parse_pair(cfg_value: dict | None) -> dict | None:
+    """The pair-read setting (cfg "pair"): {"weight": the adapter read's share (default 0.5), "temperatures": the
+    base read's per-type temperatures}. None or {"weight": 1} = one read."""
+    if not cfg_value:
+        return None
+    if not isinstance(cfg_value, dict):
+        raise ValueError(f"pair must be an object, not {cfg_value!r}")
+    w = float(cfg_value.get("weight", 0.5))
+    if not 0.0 <= w <= 1.0:
+        raise ValueError(f"pair weight {w} outside [0, 1]")
+    if w == 1.0:
+        return None
+    return {"weight": w, "temperatures": {"choice": 1.0, "noul": 1.0, "score": 1.0,
+                                          **(cfg_value.get("temperatures") or {})}}
 
 
 # what a shared-prefix read that a transformers version or model cannot run raises: the request reads plainly instead
@@ -166,6 +194,14 @@ def resolve_package(path: str) -> str:
     if not read_model_config(probe).get("base_model"):
         return path  # a plain model id: transformers loads it as usual
     return snapshot_download(repo, revision=rev or None)
+
+
+def _label_probs(question: dict, answer: dict) -> dict[str, float]:
+    """An answer's probabilities keyed by option label (a yes/no answer's true / false back to yes / no)."""
+    p = answer["probabilities"]
+    if question["type"] == "noul":
+        return {"no": float(p["false"]), "yes": float(p["true"])}
+    return {str(k): float(v) for k, v in p.items()}
 
 
 def _subquestion(question: dict, opts: list[tuple[str, str | None]]) -> dict:
@@ -234,11 +270,23 @@ class DecisionModel:
         # (prompt.REREAD_LAYOUTS) and the two distributions are averaged (or the second kept: combine "replace").
         # Off unless the config has "reread" or $CHON_REREAD sets it; never for choices over 16 options.
         self.reread = parse_reread(cfg.get("reread"), os.environ.get("CHON_REREAD"))
-        if self.reread and self.style == "decider" and self.reread["layout"] != "twice":
+        if self.reread and self.style == "decider" and self.reread["layout"] not in ("twice",) + REREAD_ORDERS:
             # the decider style has no sandwich layout: refused here rather than when an unsure answer is read again
-            raise ValueError(f"prompt_style 'decider' has no {self.reread['layout']!r} second read (use 'twice')")
+            raise ValueError(f"prompt_style 'decider' has no {self.reread['layout']!r} second read "
+                             f"(use 'twice' or 'reverse')")
         self.reread_stats = {"questions": 0, "reread": 0, "extra_tokens": 0, "deadline_skipped": 0}
+        # pair read (cfg "pair": {"weight": w, "temperatures": {...}}): every request read twice, with the adapter and
+        # without it (the plain base model in the same prompt), each read calibrated with its own temperatures (the
+        # base read's in pair["temperatures"]) and second-read as configured, then averaged (w x adapter + (1 - w) x
+        # base) before the final rules (post-calibration, the yes/no commit band) run once on the average. Needs an
+        # unmerged adapter (load keeps it unmerged).
+        self.pair = parse_pair(cfg.get("pair"))
+        self._skip_commit = False
+        if self.pair is not None and model is not None and not hasattr(model, "disable_adapter"):
+            raise ValueError("a pair read needs the adapter unmerged (a PEFT model): this model has none")
         self.think = dict(cfg["think"]) if cfg.get("think") else None
+        if self.pair is not None and self.think:
+            raise ValueError("a pair read is not supported with thinking")
         self.think_tokens: list[int | None] = []
         # deadline (predict(..., deadline=)): the one-pass answer is always kept; the reasoning runs only with the
         # tokens the time left allows (seconds per token measured per call, first at the server's warm-up), and a
@@ -285,7 +333,8 @@ class DecisionModel:
              max_batch_tokens: int = 32768, compile: bool = False, think: dict | None | bool = None,
              merge: bool | None = None) -> "DecisionModel":
         """think: a think config (dict), False to switch it off, None to use the model's config.
-        merge: merge the adapter into the weights (default: yes, unless thinking needs the base model)."""
+        merge: merge the adapter into the weights (default: yes, unless thinking or a pair read needs the base
+        model)."""
         device = resolve_device(device)
         path = resolve_package(path)
         own = read_model_config(path)
@@ -298,6 +347,7 @@ class DecisionModel:
             cfg["think"] = think
         if merge is None:
             merge = not (cfg.get("think") and (cfg["think"].get("generator", "base") in ("base", "reason")))
+            merge = merge and not parse_pair(cfg.get("pair"))   # the pair's base read switches the adapter off
         tok_dir = adapter if adapter and os.path.exists(os.path.join(adapter, "tokenizer_config.json")) else path
         tok = load_tokenizer(tok_dir)
         model = load_causal_lm(path, dtype=dtype, attn_implementation=attn_implementation,
@@ -469,8 +519,9 @@ class DecisionModel:
     def _apply_reread(self, qtypes, orders, seqs, probs, encode_at, logits_fn) -> tuple[int, int]:
         """Average a second read into the probabilities of unsure questions, or put it in place of the first
         (reread["combine"] = "replace"), in place (calibrated probabilities). Skipped when the request's deadline
-        leaves no time for another read. encode_at(i, layout) -> the second-read ids of question i.
-        Returns (questions re-read, their prompt tokens)."""
+        leaves no time for another read. encode_at(i, layout, order=None) -> the second-read ids of question i
+        (layout None: the first read's layout; order None: its option order). Returns (questions re-read, their prompt
+        tokens)."""
         rr = self.reread
         self.reread_stats["questions"] += len(seqs)
         if not rr:
@@ -482,9 +533,12 @@ class DecisionModel:
                and len(seqs[i]) <= rr["max_tokens"]]
         if not idx:
             return 0, 0
-        seqs2 = [encode_at(i, rr["layout"]) for i in idx]
+        rev = rr["layout"] == "reverse"
+        seqs2 = [encode_at(i, None, list(reversed(orders[i]))) if rev else encode_at(i, rr["layout"]) for i in idx]
         for i, row in zip(idx, logits_fn(seqs2, [len(orders[i]) for i in idx])):
             p2 = softmax(row, self.temperatures.get(qtypes[i], 1.0))
+            if rev:   # back to the first read's option order
+                p2 = list(reversed(p2))
             probs[i] = list(p2) if rr.get("combine") == "replace" else [(a + b) / 2 for a, b in zip(probs[i], p2)]
         extra = sum(len(x) for x in seqs2)
         self.reread_stats["reread"] += len(idx)
@@ -648,6 +702,8 @@ class DecisionModel:
         return gen_tokens
 
     def _commit(self, qtypes, orders, probs) -> None:
+        if getattr(self, "_skip_commit", False):   # a pair member's read: the rules run once, on the average
+            return
         for i, qt in enumerate(qtypes):  # post-calibration first, so the commit rule sees the final P(yes)
             t = float(self.post_temperatures.get(qt, 1.0))
             if t != 1.0:
@@ -666,16 +722,52 @@ class DecisionModel:
                 py = hi if py >= 0.5 else lo
                 probs[i] = [py if j == y else 1.0 - py for j in range(len(order))]
 
+    # ------------------------------------------------------------------ pair read
+    @contextlib.contextmanager
+    def _member(self, base: bool):
+        """One member of a pair read: the final rules skipped; base=True also switches the adapter off and reads with
+        the base read's temperatures."""
+        was_t, was_skip = self.temperatures, self._skip_commit
+        self._skip_commit = True
+        ctx = self.model.disable_adapter() if base else contextlib.nullcontext()
+        try:
+            if base:
+                self.temperatures = dict(self.pair["temperatures"])
+            with ctx:
+                yield
+        finally:
+            self.temperatures, self._skip_commit = was_t, was_skip
+
+    def _average(self, a: Sequence[float], b: Sequence[float]) -> list[float]:
+        w = self.pair["weight"]
+        return [w * x + (1.0 - w) * y for x, y in zip(a, b)]
+
     def distributions(self, requests: Sequence[tuple[Any, dict, Sequence[str] | None]],
                       calibrated: bool = True, think: bool = True, share_prefix: bool = False,
                       group_states: bool = True) -> list[dict[str, float]]:
+        """requests: (state, question, option order or None). Returns label -> probability (a pair read: both reads
+        averaged, see __init__; calibrated=False reads the adapter alone, as temperatures are fitted on single reads)."""
+        if getattr(self, "pair", None) is None or not calibrated or self._skip_commit:
+            return self._distributions(requests, calibrated, think, share_prefix, group_states)
+        with self._member(base=False):
+            da = self._distributions(requests, calibrated, think, share_prefix, group_states)
+        with self._member(base=True):
+            db = self._distributions(requests, calibrated, think, share_prefix, group_states)
+        orders = [list(d) for d in da]
+        probs = [self._average([d[k] for k in o], [e[k] for k in o]) for d, e, o in zip(da, db, orders)]
+        self._commit([q["type"] for _, q, _ in requests], orders, probs)
+        return [dict(zip(o, p)) for o, p in zip(orders, probs)]
+
+    def _distributions(self, requests: Sequence[tuple[Any, dict, Sequence[str] | None]],
+                       calibrated: bool = True, think: bool = True, share_prefix: bool = False,
+                       group_states: bool = True) -> list[dict[str, float]]:
         """requests: (state, question, option order or None). Returns label -> probability.
         group_states=False: every request is its own request (one question); by default the questions about one
         state are read as one request (a header model lists them all). The second read applies to calibrated reads
         only (temperatures are fitted on single reads).
         share_prefix: the first reads about one state go through the shared-prefix read (the state once, each
         question masked to it), which equals separate passes; models it does not support read plainly."""
-        seqs, orders, fitted, asked = [], [], [], []
+        seqs, orders, fitted, asked, layouts = [], [], [], [], []
         fitted_cache: dict[int, str] = {}
         asked_of: dict = {}
         if self.layout in ("header", "hybrid_header"):  # every question asked about each state, in order, once each
@@ -690,8 +782,9 @@ class DecisionModel:
             if key not in fitted_cache:
                 fitted_cache[key] = self.builder.fit_state(state)[0]
             asked.append(asked_of.get(_state_key(state) if group_states else r))
+            layouts.append(self.layout_for(len(asked[-1] or [None])))
             seqs.append(self.encode(state, question, order, fitted_state=fitted_cache[key],
-                                    layout=self.layout_for(len(asked[-1] or [None])), asked=asked[-1]))
+                                    layout=layouts[-1], asked=asked[-1]))
             orders.append(list(order))
             fitted.append(fitted_cache[key])
         n_opts = [len(o) for o in orders]
@@ -700,8 +793,9 @@ class DecisionModel:
         probs = [softmax(lg, self.temperatures.get(qt, 1.0) if calibrated else 1.0) for lg, qt in zip(logits, qtypes)]
         if calibrated:
             self._apply_reread(qtypes, orders, seqs, probs,
-                               lambda i, lay: self.encode(requests[i][0], requests[i][1], orders[i],
-                                                          fitted_state=fitted[i], layout=lay, asked=asked[i]),
+                               lambda i, lay, order=None: self.encode(requests[i][0], requests[i][1], order or orders[i],
+                                                                      fitted_state=fitted[i], layout=lay or layouts[i],
+                                                                      asked=asked[i]),
                                self.raw_logits)
         self.think_tokens = self._apply_think(qtypes, orders, seqs, logits, probs) if (think and calibrated) \
             else [None] * len(seqs)
@@ -711,7 +805,38 @@ class DecisionModel:
 
     # ------------------------------------------------------------------ API shape
     def predict(self, state: Any, questions: dict[str, dict], deadline: float | None = None) -> tuple[dict, dict]:
-        """TypeSafe /v1/systemone semantics. Returns (answers, usage).
+        """TypeSafe /v1/systemone semantics. Returns (answers, usage). A pair read (cfg "pair") reads the request with
+        the adapter, then without it if the deadline leaves time, and averages the two (see __init__); usage["pair"]
+        says how many reads were averaged (2, or 1 when the deadline left no time for the base read)."""
+        if getattr(self, "pair", None) is None or self._skip_commit:
+            return self._predict(state, questions, deadline)
+        with self._member(base=False):
+            ans_a, usage = self._predict(state, questions, deadline)
+        both = deadline is None or time.monotonic() + 2 * self._read_s + 0.5 <= deadline
+        ans_b, usage_b = (None, None)
+        if both:
+            with self._member(base=True):
+                ans_b, usage_b = self._predict(state, questions, deadline)
+        names = list(questions)
+        qs = [questions[n] for n in names]
+        orders, probs = [], []
+        for n, q in zip(names, qs):
+            pa = _label_probs(q, ans_a[n])
+            order = list(pa)
+            orders.append(order)
+            probs.append(self._average([pa[k] for k in order], [_label_probs(q, ans_b[n])[k] for k in order])
+                         if both else [pa[k] for k in order])
+        self._commit([q["type"] for q in qs], orders, probs)
+        answers = {n: format_answer(q, dict(zip(o, p))) for n, q, o, p in zip(names, qs, orders, probs)}
+        if both:
+            for k in ("input_tokens", "output_tokens"):
+                usage[k] = usage.get(k, 0) + usage_b.get(k, 0)
+            usage["forward_s"] = round(usage.get("forward_s", 0.0) + usage_b.get("forward_s", 0.0), 4)
+        usage["pair"] = 2 if both else 1
+        return answers, usage
+
+    def _predict(self, state: Any, questions: dict[str, dict], deadline: float | None = None) -> tuple[dict, dict]:
+        """One read of a request (predict's semantics).
         deadline: a time.monotonic() by which to answer (chon.serve sets it from the request's arrival): the
         one-pass answers always stand; a second read or the reasoning of unsure answers runs only if it fits before it.
         A choice with more than MAX_OPTIONS options (up to MAX_OPTIONS ** 2) is read in groups, then a final round
@@ -769,7 +894,8 @@ class DecisionModel:
                 probs = [softmax(lg, self.temperatures.get(qt, 1.0)) for lg, qt in zip(logits, qtypes)]
                 n_rr, rr_tokens = self._apply_reread(
                     qtypes, orders, seqs, probs,
-                    lambda i, lay: self.encode(state, questions[normal[i]], orders[i], fitted_state=fitted, layout=lay),
+                    lambda i, lay, order=None: self.encode(state, questions[normal[i]], order or orders[i],
+                                                           fitted_state=fitted, layout=lay),
                     self._logits)
                 if n_rr:
                     usage["input_tokens"] += rr_tokens

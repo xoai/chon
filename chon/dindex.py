@@ -14,9 +14,10 @@ Engine settings for the board (its rules: no truncation, every option gets a pro
   capacity refusal ("maximum context length") instead of cutting, choices over 16 options read in groups of at most
   16 then a final round between the group winners, and no yes/no commit band (a JevBench-specific rule). The prompt
   layout (state_first, header, hybrid_header), the prompt style (chon, decider), whether the letters are read under
-  the final logit soft cap and any second read of unsure answers are the model's own settings (chon_config.json
-  "prompt_layout" / "prompt_style" / "uncap_logits" / "reread"; $CHON_REREAD overrides the second read) and are stated
-  in the run's provenance.
+  the final logit soft cap, any second read of unsure answers ("twice", "sandwich" or "reverse") and a pair read (every
+  request read with the adapter and without it, averaged) are the model's own settings (chon_config.json
+  "prompt_layout" / "prompt_style" / "uncap_logits" / "reread" / "pair"; $CHON_REREAD overrides the second read) and are
+  stated in the run's provenance.
 
 Latency (the board lists a model only if its median, mean and 80th-percentile request time are each under 1 s on one
 RTX PRO 6000, 96 GB): the shared-prefix read is on by default (chon_config.json "prefix_cache", or
@@ -92,9 +93,23 @@ class ChonEngine(Engine):
             f"most {rr['max_tokens']} tokens, is read a second time in the {rr['layout']!r} layout"
             + ((" (the request written out twice" + (", the question list included when the first read had one)"
                                                        if self.dm.layout != "state_first" else ")"))
-               if rr["layout"] == "twice" else "") +(" and the two distributions are averaged" if rr["combine"] == "avg"
-                           else " and the second read replaces the first")
+               if rr["layout"] == "twice" else "")
+            + (" (the first read's prompt with the options in reverse order, mapped back to the options)"
+               if rr["layout"] == "reverse" else "")
+            + (" and the two distributions are averaged" if rr["combine"] == "avg"
+               else " and the second read replaces the first")
             + "; choices over 16 options are read once. " if rr else "Every question is read once (no second read). ")
+        pair = self.dm.pair
+        pair_text = (
+            "Every request is read twice, with the adapter and with it switched off (the base model in the same "
+            "prompt), each read calibrated with its own temperatures (the base read's: "
+            + ", ".join(f"{k} {v:g}" for k, v in pair["temperatures"].items())
+            + ") and second-read as set, and the two are averaged "
+            f"({pair['weight']:g} x adapter + {1 - pair['weight']:g} x base) before the final rules (post-calibration"
+            + (", the yes/no commit band" if noul_commit else "") + ") run once on the average. " if pair else "")
+        if pair:   # two reads per request
+            self.latency = type(self).latency + (" With the pair read, each request is read twice (with the adapter "
+                                                 "and with it switched off).")
         prefix_text = ("The tokens all reads of a request share (template start, question list, state) are run "
                        "once per request and shared by its questions through the key/value cache, each question masked "
                        "to the prefix and its own tokens (the group and final rounds and second reads that start with "
@@ -104,11 +119,11 @@ class ChonEngine(Engine):
             "noul_commit": bool(noul_commit), "temperatures": self.dm.temperatures,
             "post_temperatures": self.dm.post_temperatures,
             "prompt_layout": self.dm.layout, "prompt_style": self.dm.style, "uncap_logits": self.dm.uncapped,
-            "reread": rr, "prefix_cache": self.dm.prefix_cache,
+            "pair": pair, "reread": rr, "prefix_cache": self.dm.prefix_cache,
             "policy": "One read per question of the option letters (A-P) at the end of one fixed prompt "
                       f"(layout {self.dm.layout!r}: {layout_text}); " + style_text +
                       "choices with more than 16 options are read in groups of at most 16, then a final round "
-                      "between the group winners, P = P(group wins) x P(option | group). " + reread_text +
+                      "between the group winners, P = P(group wins) x P(option | group). " + reread_text + pair_text +
                       (prefix_text if self.dm.prefix_cache else
                        "Every read runs its whole prompt (no shared-prefix read). ") +
                       "A state over max_state_tokens is refused as unsupported (maximum context length), never "

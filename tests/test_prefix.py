@@ -34,6 +34,15 @@ def fixture_ok(tiny_model_dir):
     return fp["weights"] == want["weights"]
 
 
+@pytest.fixture(scope="module")
+def adapter_ok(tiny_dm):
+    """Whether the tiny LoRA adapter's weights are the ones the golden pair cases were made with."""
+    from parity_cases import adapter_model
+    from tiny_model import adapter_fingerprint
+
+    return adapter_fingerprint(adapter_model(tiny_dm.model)) == GOLDEN["made_with"]["fixture"].get("adapter")
+
+
 def _floats(x, path=""):
     if isinstance(x, dict):
         out = {}
@@ -68,7 +77,7 @@ def test_golden_covers_every_case():
 
 
 @pytest.mark.parametrize("name", [c["name"] for c in PREFIX_CASES])
-def test_prefix_read_matches_training_code_and_plain_path(name, tiny_dm, fixture_ok):
+def test_prefix_read_matches_training_code_and_plain_path(name, tiny_dm, fixture_ok, adapter_ok):
     from chon.infer import DecisionModel
 
     case = BY_NAME[name]
@@ -81,7 +90,7 @@ def test_prefix_read_matches_training_code_and_plain_path(name, tiny_dm, fixture
     for k in ("usage", "served_reads"):
         if k in want:
             assert got[k] == want[k]
-    if not fixture_ok:
+    if not fixture_ok or (case.get("adapter") and not adapter_ok):
         pytest.skip("reads match; the tiny weights differ from the golden ones (torch version?)")
     _close(_out(got), _out(want), TOL_TRAINING, name)
     # and the plain path's answers: the golden ones for the parity cases, a plain run for the long states
@@ -327,3 +336,16 @@ def test_plain_parity_cases_stay_on_the_plain_path(tiny_dm):
 
     got = run_case(DecisionModel, tiny_dm.model, tiny_dm.tok, next(c for c in CASES if c["name"] == "header_multi"))
     assert "prefix_tokens" not in got["usage"] and got["reads"] == PLAIN["cases"]["header_multi"]["reads"]
+
+
+def test_pair_and_reverse_reads_go_through_the_shared_prefix():
+    """1.5.0: each member of a pair read prepares the request's shared prefix (the base read's keys and values with the
+    adapter off), and a reverse second read, which starts with the first read's prefix, reads against it."""
+    g = GOLDEN["cases"]
+    for name in ("long_pair_header_reread", "long_pair_dec_reverse", "long_pair_many_commit", "pair_reverse"):
+        r = g[name]
+        assert len(r["prefix"]) == 2 and r["prefix"][0] == r["prefix"][1] > 0 and not r["reads"]
+        assert all(x["prefix"] == r["prefix"][0] for x in r["letter_reads"]) and r["usage"]["pair"] == 2
+    for name in ("long_rev_header", "rev_header_avg"):
+        r = g[name]
+        assert len(r["letter_reads"]) == 2 and r["letter_reads"][1]["prefix"] == r["prefix"][0] > 0
