@@ -15,8 +15,13 @@ unsure answer runs only with the time left, shortened or skipped to fit, and dro
 reply never waits past a client's time limit for a better answer.
 
 The prompt layout ("prompt_layout": state_first, header or hybrid_header), the prompt style ("prompt_style": chon or
-decider), "uncap_logits" and the pair read ("pair": every request read with the adapter and without it, averaged) come
-from the model's chon_config.json.
+decider), "uncap_logits", temperatures per category ("temperature_categories") and the pair read ("pair": every request
+read with the adapter and without it, averaged) come from the model's chon_config.json.
+
+Yes/no commit band (--noul-commit LO,HI or off; default: the model's "noul_commit"): a served P(yes) strictly between
+0.2 and 0.8 moves to LO or HI, whichever is nearer. JevBench scores such an answer as an abstention, so a JevBench
+deployment serves with the band (e.g. 0.199,0.801); the Decision Index does not, and the release package ships with it
+off.
 
 Shared-prefix read (default on; the model's "prefix_cache", or --prefix-cache on|off): the part every read of a request
 shares (template start, question list, state) runs once and each question reads only its own tokens against it, with
@@ -49,8 +54,10 @@ def create_app(model, api_key: str | None = None, deadline_s: float = 0.0):
         return {"ok": True, "model": model.name, "deadline_s": deadline_s or None,
                 "deadline": dict(getattr(model, "deadline_stats", {}) or {}),
                 "prompt_layout": getattr(model, "layout", None), "prompt_style": getattr(model, "style", None),
-                "uncap_logits": getattr(model, "uncapped", None), "pair": getattr(model, "pair", None),
-                "reread": getattr(model, "reread", None),
+                "uncap_logits": getattr(model, "uncapped", None),
+                "temperature_categories": len(getattr(model, "temperature_categories", None) or {}),
+                "noul_commit": list(nc) if (nc := getattr(model, "noul_commit", None)) else None,
+                "pair": getattr(model, "pair", None), "reread": getattr(model, "reread", None),
                 "reread_stats": dict(getattr(model, "reread_stats", {}) or {}),
                 "prefix_cache": getattr(model, "prefix_cache", None),
                 "prefix_stats": dict(getattr(model, "prefix_stats", {}) or {})}
@@ -91,6 +98,16 @@ def create_app(model, api_key: str | None = None, deadline_s: float = 0.0):
     return app
 
 
+def _noul_commit_arg(value: str):
+    """--noul-commit: "LO,HI" (0 < LO < 0.5 < HI < 1) or "off"."""
+    from .infer import parse_noul_commit
+
+    try:
+        return parse_noul_commit(value) or "off"
+    except ValueError as e:
+        raise argparse.ArgumentTypeError(str(e)) from None
+
+
 def main(argv=None) -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--model", required=True)
@@ -108,8 +125,13 @@ def main(argv=None) -> None:
                     help="seconds from a request's arrival to its answer: the reasoning is shortened or skipped to "
                          "fit, the one-pass answer always stands (0 = no deadline; default 8, $CHON_DEADLINE_S)")
     ap.add_argument("--reread", default=None, metavar="BELOW[,LAYOUT[,MAX_TOKENS[,COMBINE]]]",
-                    help="second read of unsure answers, e.g. 0.9, 0.9,twice,2000,avg or 0.9,reverse; off switches "
-                         "off the model's own setting (default: $CHON_REREAD, else the model's chon_config.json)")
+                    help="second read of unsure answers, e.g. 0.9, 0.9,twice,2000,avg, 0.9,reverse or 0.9,rotate; off "
+                         "switches off the model's own setting (default: $CHON_REREAD, else the model's "
+                         "chon_config.json)")
+    ap.add_argument("--noul-commit", default=None, type=_noul_commit_arg, metavar="LO,HI|off",
+                    help="the yes/no commit band: a P(yes) strictly between 0.2 and 0.8 is served as LO or HI, "
+                         "whichever is nearer (JevBench counts such answers as abstentions), e.g. 0.199,0.801; off "
+                         "switches off the model's own band (default: the model's chon_config.json \"noul_commit\")")
     ap.add_argument("--prefix-cache", default=None, choices=["on", "off"],
                     help="the shared-prefix read: a request's shared part (state, question list) read once for all its "
                          "questions, same answers (default: the model's chon_config.json \"prefix_cache\", else on)")
@@ -128,6 +150,8 @@ def main(argv=None) -> None:
                                quantize=args.quantize, compile=args.compile, think=think)
     if args.prefix_cache is not None:
         model.cfg["prefix_cache"] = args.prefix_cache == "on"
+    if args.noul_commit is not None:
+        model.noul_commit = None if args.noul_commit == "off" else args.noul_commit
     for kv in args.think_set:
         k, _, v = kv.partition("=")
         if model.think is not None:
@@ -135,11 +159,15 @@ def main(argv=None) -> None:
     print(f"[serve] {model.name} on {model.device}, prompt layout {model.layout}"
           + (f", prompt style {model.style}" if model.style != "chon" else "")
           + (", letters read without the final soft cap" if model.uncapped else "")
+          + (f", {len(model.temperature_categories)} temperatures per category" if model.temperature_categories
+             else "")
           + (f", pair read (adapter weight {model.pair['weight']:g})" if model.pair else "")
           + (f", reasoning engine {model.think.get('engine', 'hf')}" if model.think else ", no reasoning")
           + (f", second read below {model.reread['below']:g} ({model.reread['layout']}, {model.reread['combine']}, "
              f"prompts up to {model.reread['max_tokens']} tokens)" if model.reread else ", no second read")
-          + (", shared-prefix read on" if model.prefix_cache else ", shared-prefix read off"),
+          + (", shared-prefix read on" if model.prefix_cache else ", shared-prefix read off")
+          + (f", yes/no commit band {model.noul_commit[0]:g}/{model.noul_commit[1]:g}" if model.noul_commit
+             else ", no yes/no commit band"),
           flush=True)
     # warm-up so the first measured request is not a cold start; the reasoning path too (its first call compiles,
     # and its speed sets how many tokens a deadline allows)

@@ -21,11 +21,21 @@ soft cap off (chon.modeling.uncap_logits). A model trained with either is read t
 Optional second read of unsure answers (config key "reread", or $CHON_REREAD="below,layout,max_tokens,combine"):
 a choice or yes/no question whose top calibrated probability is under "below", in a prompt of at most "max_tokens"
 tokens, is read again in a second-read layout ("twice": the request written out twice, "twice_header" for a header
-read; or "sandwich"; or "reverse": the first read's prompt with the options in reverse order, mapped back to the
-options) and the two distributions are averaged ("combine": "avg") or the second kept ("replace"). Skipped when the
-request's deadline leaves no time for it.
+read; or "sandwich"; or "reverse": the first read's prompt with the options in reverse order; or "rotate": the first
+read's prompt with the options rotated by half, the first half moved to the end; both mapped back to the options by
+label) and the two distributions are averaged ("combine": "avg") or the second kept ("replace"), the second read
+calibrated with the question's own temperature. Skipped when the request's deadline leaves no time for it.
 
     "reread": {"below": 0.9, "layout": "twice", "max_tokens": 2000, "combine": "avg"}
+
+Optional temperatures per category (config key "temperature_categories"): a question takes the temperature of its most
+specific category, "<type>:<options>:<state>", then "<type>:<options>", else its type's ("temperatures"). Options are
+binned 2 / 3-4 / 5-9 / 10-25 / 26+, the state is "empty" (none or blank), "text" or "json" (anything not a string: a
+JSON object, a conversation). Used by first reads, second reads and both rounds of a choice over 16 options (every
+such choice of a request takes the category of the largest one, by its number of options). The pair read's base read
+takes the pair's own "temperature_categories" (none when the pair has none), not the model's.
+
+    "temperature_categories": {"choice:3-4:text": 1.2, "choice:3-4": 1.1, "noul:2:json": 0.9}
 
 Optional pair read (config key "pair"; needs an adapter, loaded unmerged): every request is read twice, with the adapter
 and with it switched off (the base model in the same prompt), each read calibrated with its own temperatures (the base
@@ -98,9 +108,40 @@ def softmax(xs: Sequence[float], temperature: float = 1.0) -> list[float]:
 
 REREAD_DEFAULTS = {"below": 0.9, "layout": "twice", "max_tokens": 2000, "types": ["choice", "noul"], "combine": "avg"}
 REREAD_COMBINE = ("avg", "replace")   # average the two reads, or keep the second
-# "reverse": the second read is the first read's prompt with the options in reverse order (position bias averaged out),
-# mapped back to the options before it is combined
-REREAD_ORDERS = ("reverse",)
+# "reverse": the second read is the first read's prompt with the options in reverse order (position bias averaged out);
+# "rotate": the options rotated by half (the first half moved to the end); either mapped back to the options by label
+# before it is combined
+REREAD_ORDERS = ("reverse", "rotate")
+
+# Temperatures per category (cfg "temperature_categories"): a question takes the temperature of its most specific
+# category -- "<type>:<options>:<state>", then "<type>:<options>" -- else its type's. Options are binned 2 / 3-4 / 5-9 /
+# 10-25 / 26+, the state is "empty", "text" or "json" (anything not a string: JSON objects, conversations).
+OPTION_BINS = ((2, "2"), (4, "3-4"), (9, "5-9"), (25, "10-25"))
+
+
+def option_bin(n: int) -> str:
+    return next((name for hi, name in OPTION_BINS if n <= hi), "26+")
+
+
+def state_kind(state: Any) -> str:
+    if state is None or (isinstance(state, str) and not state.strip()):
+        return "empty"
+    return "text" if isinstance(state, str) else "json"
+
+
+def category_keys(qtype: str, n_options: int, state: Any) -> list[str]:
+    """A question's temperature categories, most specific first."""
+    b = option_bin(n_options)
+    return [f"{qtype}:{b}:{state_kind(state)}", f"{qtype}:{b}"]
+
+
+def parse_categories(cfg_value: dict | None) -> dict[str, float]:
+    """cfg "temperature_categories" ({category: temperature}) as {str: float}; {} when unset."""
+    if not cfg_value:
+        return {}
+    if not isinstance(cfg_value, dict):
+        raise ValueError(f"temperature_categories must be an object, not {cfg_value!r}")
+    return {str(k): float(v) for k, v in cfg_value.items()}
 
 
 def parse_reread(cfg_value: dict | None, env: str | None = None) -> dict | None:
@@ -133,9 +174,35 @@ def parse_reread(cfg_value: dict | None, env: str | None = None) -> dict | None:
     return rr
 
 
+def reorder_options(order: Sequence[str], how: str) -> list[str]:
+    """The second read's option order: reversed ("reverse"), or rotated by half ("rotate": the first len // 2 options
+    moved to the end)."""
+    order = list(order)
+    if how == "reverse":
+        return order[::-1]
+    k = len(order) // 2
+    return order[k:] + order[:k]
+
+
+def parse_noul_commit(value) -> tuple[float, float] | None:
+    """A yes/no commit band given at start-up ("LO,HI" or [lo, hi]; "off" = none), checked 0 < LO < 0.5 < HI < 1."""
+    if isinstance(value, str):
+        if value.strip().lower() in ("off", "none", "false", "0", "no", ""):
+            return None
+        value = value.split(",")
+    try:
+        lo, hi = (float(x) for x in value)
+    except (TypeError, ValueError):
+        raise ValueError(f"noul_commit must be LO,HI or off, not {value!r}") from None
+    if not 0.0 < lo < 0.5 < hi < 1.0:
+        raise ValueError(f"noul_commit {lo:g},{hi:g}: needs 0 < LO < 0.5 < HI < 1")
+    return lo, hi
+
+
 def parse_pair(cfg_value: dict | None) -> dict | None:
     """The pair-read setting (cfg "pair"): {"weight": the adapter read's share (default 0.5), "temperatures": the
-    base read's per-type temperatures}. None or {"weight": 1} = one read."""
+    base read's per-type temperatures, and "temperature_categories": the base read's per-category ones when the pair
+    sets any}. None or {"weight": 1} = one read."""
     if not cfg_value:
         return None
     if not isinstance(cfg_value, dict):
@@ -145,8 +212,12 @@ def parse_pair(cfg_value: dict | None) -> dict | None:
         raise ValueError(f"pair weight {w} outside [0, 1]")
     if w == 1.0:
         return None
-    return {"weight": w, "temperatures": {"choice": 1.0, "noul": 1.0, "score": 1.0,
+    pair = {"weight": w, "temperatures": {"choice": 1.0, "noul": 1.0, "score": 1.0,
                                           **(cfg_value.get("temperatures") or {})}}
+    cats = parse_categories(cfg_value.get("temperature_categories"))
+    if cats:   # (left out when unset, so a 1.5.0 pair setting reports as it did)
+        pair["temperature_categories"] = cats
+    return pair
 
 
 # what a shared-prefix read that a transformers version or model cannot run raises: the request reads plainly instead
@@ -257,6 +328,9 @@ class DecisionModel:
         self._req_layout: str | None = None
         self._req_asked: list[str] | None = None   # the header layout's question list for the current request
         self.temperatures = {"choice": 1.0, "noul": 1.0, "score": 1.0, **cfg.get("temperatures", {})}
+        # temperatures per category (cfg "temperature_categories"): the most specific of "<type>:<options>:<state>",
+        # "<type>:<options>" (category_keys), else the type's temperature (_temp)
+        self.temperature_categories = parse_categories(cfg.get("temperature_categories"))
         self.max_batch_tokens = int(max_batch_tokens)
         # yes/no commit rule: a P(yes) strictly between 0.2 and 0.8 is an abstention under common scoring, so a served
         # P(yes) inside that band moves just outside its nearer edge, e.g. [0.199, 0.801]
@@ -273,7 +347,7 @@ class DecisionModel:
         if self.reread and self.style == "decider" and self.reread["layout"] not in ("twice",) + REREAD_ORDERS:
             # the decider style has no sandwich layout: refused here rather than when an unsure answer is read again
             raise ValueError(f"prompt_style 'decider' has no {self.reread['layout']!r} second read "
-                             f"(use 'twice' or 'reverse')")
+                             f"(use 'twice', 'reverse' or 'rotate')")
         self.reread_stats = {"questions": 0, "reread": 0, "extra_tokens": 0, "deadline_skipped": 0}
         # pair read (cfg "pair": {"weight": w, "temperatures": {...}}): every request read twice, with the adapter and
         # without it (the plain base model in the same prompt), each read calibrated with its own temperatures (the
@@ -516,12 +590,12 @@ class DecisionModel:
         return out  # type: ignore[return-value]
 
     # ------------------------------------------------------------------ second read when unsure
-    def _apply_reread(self, qtypes, orders, seqs, probs, encode_at, logits_fn) -> tuple[int, int]:
+    def _apply_reread(self, qtypes, orders, seqs, probs, encode_at, logits_fn, temps=None) -> tuple[int, int]:
         """Average a second read into the probabilities of unsure questions, or put it in place of the first
         (reread["combine"] = "replace"), in place (calibrated probabilities). Skipped when the request's deadline
         leaves no time for another read. encode_at(i, layout, order=None) -> the second-read ids of question i
-        (layout None: the first read's layout; order None: its option order). Returns (questions re-read, their prompt
-        tokens)."""
+        (layout None: the first read's layout; order None: its option order). temps: each question's temperature (its
+        category's, _temp; default its type's). Returns (questions re-read, their prompt tokens)."""
         rr = self.reread
         self.reread_stats["questions"] += len(seqs)
         if not rr:
@@ -533,12 +607,14 @@ class DecisionModel:
                and len(seqs[i]) <= rr["max_tokens"]]
         if not idx:
             return 0, 0
-        rev = rr["layout"] == "reverse"
-        seqs2 = [encode_at(i, None, list(reversed(orders[i]))) if rev else encode_at(i, rr["layout"]) for i in idx]
+        reorder = rr["layout"] in REREAD_ORDERS
+        order2 = {i: reorder_options(orders[i], rr["layout"]) for i in idx} if reorder else {}
+        seqs2 = [encode_at(i, None, order2[i]) if reorder else encode_at(i, rr["layout"]) for i in idx]
         for i, row in zip(idx, logits_fn(seqs2, [len(orders[i]) for i in idx])):
-            p2 = softmax(row, self.temperatures.get(qtypes[i], 1.0))
-            if rev:   # back to the first read's option order
-                p2 = list(reversed(p2))
+            p2 = softmax(row, temps[i] if temps else self.temperatures.get(qtypes[i], 1.0))
+            if reorder:   # back to the first read's option order, by label
+                by = dict(zip(order2[i], p2))
+                p2 = [by[o] for o in orders[i]]
             probs[i] = list(p2) if rr.get("combine") == "replace" else [(a + b) / 2 for a, b in zip(probs[i], p2)]
         extra = sum(len(x) for x in seqs2)
         self.reread_stats["reread"] += len(idx)
@@ -726,17 +802,27 @@ class DecisionModel:
     @contextlib.contextmanager
     def _member(self, base: bool):
         """One member of a pair read: the final rules skipped; base=True also switches the adapter off and reads with
-        the base read's temperatures."""
-        was_t, was_skip = self.temperatures, self._skip_commit
+        the base read's temperatures (and its temperatures per category: none unless the pair sets them)."""
+        was_t, was_skip, was_c = self.temperatures, self._skip_commit, getattr(self, "temperature_categories", {})
         self._skip_commit = True
         ctx = self.model.disable_adapter() if base else contextlib.nullcontext()
         try:
             if base:
                 self.temperatures = dict(self.pair["temperatures"])
+                self.temperature_categories = dict(self.pair.get("temperature_categories") or {})
             with ctx:
                 yield
         finally:
-            self.temperatures, self._skip_commit = was_t, was_skip
+            self.temperatures, self._skip_commit, self.temperature_categories = was_t, was_skip, was_c
+
+    def _temp(self, qtype: str, n_options: int, state: Any) -> float:
+        """The temperature of a question: its most specific category's (temperature_categories), else its type's."""
+        cats = getattr(self, "temperature_categories", None)
+        if cats:
+            for k in category_keys(qtype, n_options, state):
+                if k in cats:
+                    return cats[k]
+        return self.temperatures.get(qtype, 1.0)
 
     def _average(self, a: Sequence[float], b: Sequence[float]) -> list[float]:
         w = self.pair["weight"]
@@ -790,13 +876,14 @@ class DecisionModel:
         n_opts = [len(o) for o in orders]
         logits = self._grouped_logits(seqs, n_opts, fitted) if share_prefix else self.raw_logits(seqs, n_opts)
         qtypes = [q["type"] for _, q, _ in requests]
-        probs = [softmax(lg, self.temperatures.get(qt, 1.0) if calibrated else 1.0) for lg, qt in zip(logits, qtypes)]
+        temps = [self._temp(qt, len(o), requests[r][0]) for r, (qt, o) in enumerate(zip(qtypes, orders))]
+        probs = [softmax(lg, t if calibrated else 1.0) for lg, t in zip(logits, temps)]
         if calibrated:
             self._apply_reread(qtypes, orders, seqs, probs,
                                lambda i, lay, order=None: self.encode(requests[i][0], requests[i][1], order or orders[i],
                                                                       fitted_state=fitted[i], layout=lay or layouts[i],
                                                                       asked=asked[i]),
-                               self.raw_logits)
+                               self.raw_logits, temps)
         self.think_tokens = self._apply_think(qtypes, orders, seqs, logits, probs) if (think and calibrated) \
             else [None] * len(seqs)
         if calibrated:
@@ -891,12 +978,13 @@ class DecisionModel:
                 logits = self._logits(seqs, [len(o) for o in orders])
                 self._read_s = 0.8 * self._read_s + 0.2 * (time.monotonic() - t_read)
                 qtypes = [questions[n]["type"] for n in normal]
-                probs = [softmax(lg, self.temperatures.get(qt, 1.0)) for lg, qt in zip(logits, qtypes)]
+                temps = [self._temp(qt, len(o), state) for qt, o in zip(qtypes, orders)]
+                probs = [softmax(lg, t) for lg, t in zip(logits, temps)]
                 n_rr, rr_tokens = self._apply_reread(
                     qtypes, orders, seqs, probs,
                     lambda i, lay, order=None: self.encode(state, questions[normal[i]], order or orders[i],
                                                            fitted_state=fitted, layout=lay),
-                    self._logits)
+                    self._logits, temps)
                 if n_rr:
                     usage["input_tokens"] += rr_tokens
                     usage["reread"] = n_rr
@@ -945,9 +1033,10 @@ class DecisionModel:
         """Choices with more than MAX_OPTIONS options: each group of at most MAX_OPTIONS options is read as its own
         question, then one final question between the group winners. P(option) = P(its group wins the final) x
         P(option | its group), so every option gets a probability and they sum to 1. No thinking on these. Both
-        rounds read through the request's shared prefix when one is prepared."""
-        t = self.temperatures.get("choice", 1.0)
+        rounds read through the request's shared prefix when one is prepared. The temperature: the category of the
+        request's largest such choice (by its number of options) for every one of them, as the training code reads."""
         plan, seqs, owner = planned
+        t = self._temp("choice", max((sum(len(g) for g in groups) for _, _, groups in plan), default=2), state)
         lg1 = self._logits(seqs, [m for _, _, m in owner])
         p1 = {(n, gi): softmax(lg, t) for (n, gi, _), lg in zip(owner, lg1)}
         seqs2, finals = [], []

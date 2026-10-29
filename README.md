@@ -64,6 +64,17 @@ Options:
   [Prompt layout and second read](#prompt-layout-and-second-read).
 - `--prefix-cache on|off`: the shared-prefix read (default: the model's `chon_config.json` `"prefix_cache"`, else
   on). See [Shared-prefix read](#shared-prefix-read).
+- `--noul-commit LO,HI|off` (since 1.6.0): the yes/no commit band, overriding the model's `chon_config.json`
+  `"noul_commit"` (unset keeps it). See [Yes/no commit band](#yesno-commit-band).
+
+### Yes/no commit band
+
+JevBench counts a yes/no answer whose P(yes) is strictly between 0.2 and 0.8 as an abstention, which always scores as
+wrong. With the commit band on, such an answer is served just outside the band instead, at `LO` or `HI`, whichever is
+nearer (`--noul-commit 0.199,0.801`; needs 0 < LO < 0.5 < HI < 1). A JevBench deployment should serve with the band. The
+Decision Index has no such rule, so the release package ships with the band off; `--noul-commit off` also turns off a
+band a model's config sets. `/health` (`"noul_commit"`) and the server's start line report it, and the Decision Index
+engine takes the same setting as `--option noul_commit=LO,HI` (`true` keeps the model's own band; off by default).
 
 ### Prompt layout and second read
 
@@ -108,7 +119,7 @@ combined. Choices with more than 16 options and score questions are read once.
 - `layout`: `"twice"` writes the whole request out twice (`... Read the request again: ...`) and reads the letter
   after the second copy; a header read is written out twice with its question list. `"sandwich"` is the question,
   the state, then the question again. `"reverse"` (since 1.5.0, below) is the first read's prompt with the options
-  in reverse order.
+  in reverse order, and `"rotate"` (since 1.6.0, below) the same with the options rotated by half.
 - `combine`: `"avg"` averages the two distributions; `"replace"` keeps the second read.
 - `CHON_REREAD` (or `--reread`) overrides the config: `below[,layout[,max_tokens[,combine]]]`, an empty field keeps
   its value (`0.9,twice,,replace`), and `0` or `off` turns the second read off.
@@ -201,6 +212,49 @@ kinds of questions, and the pair read combines them.
 
 **Version 1.4.0 and older ignore `"pair"`** (they read the adapter alone, merged), so serve a model that sets it with
 1.5.0 or newer. A config without `"pair"` or `"reverse"` reads exactly as in 1.4.0.
+
+### Temperatures per category
+
+Since 1.6.0 a model's `chon_config.json` can calibrate questions by category, not only by type. A question takes the
+temperature of its most specific category in `"temperature_categories"`: first `"<type>:<options>:<state>"`, then
+`"<type>:<options>"`, else its type's temperature in `"temperatures"`.
+
+```json
+"temperature_categories": {"choice:3-4:text": 1.2, "choice:3-4": 1.1, "noul:2:json": 0.9, "choice:26+": 1.4}
+```
+
+- `<type>`: `choice`, `noul` or `score`.
+- `<options>`: the number of options read, binned `2`, `3-4`, `5-9`, `10-25` or `26+`.
+- `<state>`: `empty` (no state, or only whitespace), `text` (any other string) or `json` (anything not a string: a
+  JSON object, a conversation).
+- The temperature is used wherever the question's letters are read: the first read, a second read (each question
+  with its own temperature) and both rounds of a choice over 16 options. Every such choice of a request takes the
+  category of the request's largest one (by its number of options), as the training code reads them.
+- A pair read's base read takes the pair's own `"temperature_categories"` (inside `"pair"`), and none when the pair
+  sets none; the adapter read takes the config's.
+- `/health` (how many categories), the server's start line and the Decision Index provenance (every category)
+  report them.
+
+Temperatures only reshape each read's distribution; the categories are fitted on the model's development questions.
+**Version 1.5.0 and older ignore `"temperature_categories"`** (they read every question at its type's temperature), so
+serve a model that sets them with 1.6.0 or newer.
+
+### Rotated second read
+
+Since 1.6.0 the second read can also be `"layout": "rotate"`: the unsure question is read again in the first read's
+prompt (its layout, question list and state, written once) with its options rotated by half, the first half moved to
+the end: options `A B C D E` are shown as `C D E A B`, and `A B C D` as `C D A B`. The second read's probabilities are
+mapped back to the options by label and combined as set (`"avg"` or `"replace"`). Unlike the reverse order, every
+option moves by the same number of places; for two options the two are the same.
+
+```json
+"reread": {"below": 1.01, "layout": "rotate", "max_tokens": 3000, "combine": "avg"}
+```
+
+or `CHON_REREAD="1.01,rotate,3000"` (`--reread 1.01,rotate,3000`). Everything else about the second read applies as for
+`"reverse"` (the threshold, the prompt length limit, choices over 16 options read once, skipped near the deadline, the
+shared-prefix read, the decider style). **Version 1.5.0 and older refuse `"rotate"`** at load as an unknown layout. A
+config without `"temperature_categories"` or `"rotate"` reads exactly as in 1.5.0.
 
 ### Shared-prefix read
 
@@ -352,8 +406,9 @@ The engine answers each question in one read without reasoning (that board's lat
 percentile under 1 s per request), refuses a state longer than 32,768 tokens as unsupported instead of truncating
 it, and reads choices with more than 16 options in groups. The shared-prefix read is on unless the model's config
 or `--option prefix_cache=false` turns it off; with it, a request's state is read once for all its questions. The
-model's prompt layout and style, uncapped letters, second-read, pair-read and shared-prefix settings (above) apply,
-and the run's provenance states them.
+model's prompt layout and style, uncapped letters, temperatures per category, second-read, pair-read and
+shared-prefix settings (above) apply, and the run's provenance states them. The yes/no commit band is off unless
+`--option noul_commit=LO,HI` (or `true`, the model's own band) turns it on.
 `python -m chon.dindex shard` / `merge` split the suite so several runner processes can share GPUs.
 
 ## Tests
@@ -367,9 +422,9 @@ every output probability equal golden values made with the training code (`tests
 `tests/make_golden.py`). `tests/test_prefix.py` checks the shared-prefix read: the same reads and probabilities
 as the training code's shared-prefix read (`tests/golden_prefix.json`, `make_golden.py --prefix`), and the plain
 path's probabilities within 1e-4, for every parity case and for states longer than the sliding window. The
-cases cover both prompt styles, uncapped letters on the tiny model given a soft cap, the reverse second read, and
-the pair read on the tiny model with a tiny LoRA adapter (`tiny_model.tiny_adapter`, its weights seeded like the
-model's).
+cases cover both prompt styles, uncapped letters on the tiny model given a soft cap, the reverse and rotated second
+reads, temperatures per category (every level, bin and state kind), and the pair read on the tiny model with a tiny
+LoRA adapter (`tiny_model.tiny_adapter`, its weights seeded like the model's).
 
 ## Licence
 

@@ -12,12 +12,13 @@ time; results are the same rows whichever process answered them).
 Engine settings for the board (its rules: no truncation, every option gets a probability, one fixed rendering):
   think=false (the board's latency rule: median, mean and p80 under 1 s per request), a long state limit with a
   capacity refusal ("maximum context length") instead of cutting, choices over 16 options read in groups of at most
-  16 then a final round between the group winners, and no yes/no commit band (a JevBench-specific rule). The prompt
-  layout (state_first, header, hybrid_header), the prompt style (chon, decider), whether the letters are read under
-  the final logit soft cap, any second read of unsure answers ("twice", "sandwich" or "reverse") and a pair read (every
-  request read with the adapter and without it, averaged) are the model's own settings (chon_config.json
-  "prompt_layout" / "prompt_style" / "uncap_logits" / "reread" / "pair"; $CHON_REREAD overrides the second read) and are
-  stated in the run's provenance.
+  16 then a final round between the group winners, and no yes/no commit band (a JevBench-specific rule;
+  --option noul_commit=true keeps the model's own band, --option noul_commit=LO,HI sets one). The prompt layout
+  (state_first, header, hybrid_header), the prompt style (chon, decider), whether the letters are read under the final
+  logit soft cap, temperatures per category, any second read of unsure answers ("twice", "sandwich", "reverse" or
+  "rotate") and a pair read (every request read with the adapter and without it, averaged) are the model's own settings
+  (chon_config.json "prompt_layout" / "prompt_style" / "uncap_logits" / "temperature_categories" / "reread" / "pair";
+  $CHON_REREAD overrides the second read) and are stated in the run's provenance.
 
 Latency (the board lists a model only if its median, mean and 80th-percentile request time are each under 1 s on one
 RTX PRO 6000, 96 GB): the shared-prefix read is on by default (chon_config.json "prefix_cache", or
@@ -53,21 +54,29 @@ class ChonEngine(Engine):
     def __init__(self, model="ninhnv/chon-1.0-12b", device="cuda", think=False, max_state_tokens=32768,
                  max_batch_tokens=32768, noul_commit=False, prefix_cache=None, **options):
         """prefix_cache: None = the model's setting (chon_config.json "prefix_cache", default on); true / false
-        overrides it. Options from the kit's --option key=value arrive as strings ("false" is off)."""
+        overrides it. noul_commit: false (default) = no yes/no commit band, true = the model's own (chon_config.json
+        "noul_commit"), "LO,HI" = this band (0 < LO < 0.5 < HI < 1). Options from the kit's --option key=value arrive
+        as strings ("false" is off)."""
         super().__init__(**options)
         import torch
 
-        from chon.infer import DecisionModel, flag
+        from chon.infer import DecisionModel, flag, parse_noul_commit
 
-        think, noul_commit = flag(think), flag(noul_commit)
+        band = None
+        if isinstance(noul_commit, (list, tuple)) or (isinstance(noul_commit, str) and "," in noul_commit):
+            band = parse_noul_commit(noul_commit)   # checked before the model loads
+        think, noul_commit = flag(think), band is not None or flag(noul_commit)
         self.dm = DecisionModel.load(model, device=device, think=None if think else False,
                                      max_batch_tokens=int(max_batch_tokens))
         self.dm.builder.max_state_tokens = int(max_state_tokens)
         self.dm.cfg["truncate"] = False
         if prefix_cache is not None and str(prefix_cache).strip() != "":
             self.dm.cfg["prefix_cache"] = flag(prefix_cache)
-        if not noul_commit:
+        if band is not None:
+            self.dm.noul_commit = band
+        elif not noul_commit:
             self.dm.noul_commit = None
+        commit = self.dm.noul_commit
         self._cuda = str(device).startswith("cuda") and torch.cuda.is_available()
         rr = self.dm.reread
         layout_text = {
@@ -96,17 +105,30 @@ class ChonEngine(Engine):
                if rr["layout"] == "twice" else "")
             + (" (the first read's prompt with the options in reverse order, mapped back to the options)"
                if rr["layout"] == "reverse" else "")
+            + (" (the first read's prompt with the options rotated by half, the first half moved to the end, mapped "
+               "back to the options)" if rr["layout"] == "rotate" else "")
             + (" and the two distributions are averaged" if rr["combine"] == "avg"
                else " and the second read replaces the first")
             + "; choices over 16 options are read once. " if rr else "Every question is read once (no second read). ")
+        cats = self.dm.temperature_categories
+        cats_text = (
+            f"Each answer is calibrated with the temperature of its most specific category ({len(cats)} set: "
+            "'<type>:<options>:<state>', then '<type>:<options>', the options binned 2 / 3-4 / 5-9 / 10-25 / 26+, the "
+            "state empty, text or JSON), else its type's temperature; a choice over 16 options takes the category of "
+            "the request's largest such choice. " if cats else "")
+        commit_text = (f"A yes/no answer with P(yes) strictly between 0.2 and 0.8 is served as {commit[0]:g} or "
+                       f"{commit[1]:g}, whichever is nearer (the yes/no commit band). " if commit else "")
         pair = self.dm.pair
+        pair_cats = (pair or {}).get("temperature_categories") or {}
         pair_text = (
             "Every request is read twice, with the adapter and with it switched off (the base model in the same "
             "prompt), each read calibrated with its own temperatures (the base read's: "
             + ", ".join(f"{k} {v:g}" for k, v in pair["temperatures"].items())
+            + (f", and {len(pair_cats)} per category" if pair_cats else
+               (", none per category" if cats else ""))
             + ") and second-read as set, and the two are averaged "
             f"({pair['weight']:g} x adapter + {1 - pair['weight']:g} x base) before the final rules (post-calibration"
-            + (", the yes/no commit band" if noul_commit else "") + ") run once on the average. " if pair else "")
+            + (", the yes/no commit band" if commit else "") + ") run once on the average. " if pair else "")
         if pair:   # two reads per request
             self.latency = type(self).latency + (" With the pair read, each request is read twice (with the adapter "
                                                  "and with it switched off).")
@@ -116,14 +138,16 @@ class ChonEngine(Engine):
                        "the same tokens included), so the answers equal separate passes. ")
         self.provenance = {
             "kind": "chon", "model": model, "think": bool(think), "max_state_tokens": int(max_state_tokens),
-            "noul_commit": bool(noul_commit), "temperatures": self.dm.temperatures,
+            "noul_commit": bool(noul_commit), "noul_commit_band": list(commit) if commit else None,
+            "temperatures": self.dm.temperatures, "temperature_categories": dict(cats) or None,
             "post_temperatures": self.dm.post_temperatures,
             "prompt_layout": self.dm.layout, "prompt_style": self.dm.style, "uncap_logits": self.dm.uncapped,
             "pair": pair, "reread": rr, "prefix_cache": self.dm.prefix_cache,
             "policy": "One read per question of the option letters (A-P) at the end of one fixed prompt "
                       f"(layout {self.dm.layout!r}: {layout_text}); " + style_text +
                       "choices with more than 16 options are read in groups of at most 16, then a final round "
-                      "between the group winners, P = P(group wins) x P(option | group). " + reread_text + pair_text +
+                      "between the group winners, P = P(group wins) x P(option | group). " + cats_text + reread_text +
+                      pair_text + commit_text +
                       (prefix_text if self.dm.prefix_cache else
                        "Every read runs its whole prompt (no shared-prefix read). ") +
                       "A state over max_state_tokens is refused as unsupported (maximum context length), never "

@@ -279,6 +279,157 @@ PAIR_CASES = [
 CASES = CASES + PAIR_CASES
 
 
+# ---- temperatures per category (1.6.0): a question takes the temperature of "<type>:<options>:<state>", then
+# "<type>:<options>", else its type's (TEMPS); options binned 2 / 3-4 / 5-9 / 10-25 / 26+, the state empty / text / json.
+# Every value differs from the others and from TEMPS, so a read at the wrong level gives other probabilities.
+TWO = {"type": "choice", "instructions": "Billing or shipping?", "criteria": ["billing", "shipping"]}
+SEVEN = {"type": "choice", "instructions": "Which colour is the parcel?",
+         "criteria": {c: f"the parcel is {c}" for c in ["red", "orange", "yellow", "green", "blue", "indigo", "violet"]}}
+TWELVE = {"type": "choice", "instructions": "Which month was it sent?",
+          "criteria": ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"]}
+SCORE5 = {"type": "score", "instructions": "How urgent is it?", "criteria": ["none", "low", "some", "high", "top"]}
+CATS = {
+    "choice:3-4:text": 1.9, "choice:3-4": 0.6,          # ROUTE: text state; any other state
+    "choice:2": 1.55,                                    # TWO, and ROUTE read with two options
+    "choice:5-9:text": 0.5,                              # SEVEN with a text state (a JSON state: the type's)
+    "choice:10-25": 0.7, "choice:26+": 1.75,             # TWELVE and MANY_LIST; MANY
+    "noul:2:json": 0.45, "noul:2:empty": 2.2,            # WITHIN: JSON / conversation; empty (text: the type's)
+    "score:3-4": 1.6, "score:5-9:json": 0.65,            # SEVERE: any state; SCORE5 with a JSON state
+    "choice:3-4:empty": 2.4,
+}
+CAT = {"temperature_categories": CATS}
+PAIR_CATS = {"choice:3-4": 0.75, "noul:2:text": 1.45, "score:3-4:text": 0.55}   # the base read's own
+PAIRC = {"pair": {"weight": 0.5, "temperatures": PAIR_T, "temperature_categories": PAIR_CATS}}
+PAIRC25 = {"pair": {"weight": 0.25, "temperatures": PAIR_T, "temperature_categories": PAIR_CATS}}
+ALL6 = {"route": ROUTE, "within": WITHIN, "severe": SEVERE, "two": TWO, "seven": SEVEN, "twelve": TWELVE}
+RRO = {**RR_ALL, "layout": "rotate"}
+RRO_REPLACE = {**RRO, "combine": "replace"}
+
+CATEGORY_CASES = [
+    # every level and bin, every state kind (first reads)
+    _p("cat_text", None, {**ALL6, "urgent": SCORE5}, **CAT),
+    _p("cat_json", "state_first", {**ALL6, "urgent": SCORE5}, state=JSON_STATE, **CAT),
+    _p("cat_conv", "state_first", {"route": ROUTE, "within": WITHIN, "severe": SEVERE, "urgent": SCORE5},
+       state=CONV_STATE, **CAT),
+    _p("cat_empty", "state_first", {"route": ROUTE, "within": WITHIN, "two": TWO}, state="", **CAT),
+    _p("cat_none_state", "state_first", {"route": ROUTE, "within": WITHIN}, state=None, **CAT),
+    _p("cat_blank_state", "header", {"route": ROUTE, "within": WITHIN, "severe": SEVERE}, state="   \n", **CAT),
+    _p("cat_header", "header", ALL6, **CAT),
+    _p("cat_hybrid_json", "hybrid_header", {"route": ROUTE, "within": WITHIN, "seven": SEVEN}, state=JSON_STATE, **CAT),
+    _p("cat_dec_header", "header", {**ALL6, "team": DICT_INSTR}, state=ARRAY_STATE, **CAT, **DEC),
+    _p("cat_dec_state_first", "state_first", ALL6, **CAT, **DEC),
+    _p("cat_commit_post", None, {"route": ROUTE, "within": WITHIN}, state=JSON_STATE,
+       post_temperatures={"choice": 0.8, "noul": 1.3}, noul_commit=[0.199, 0.801], **CAT),
+    # choices over 16 options: both rounds at the category of the request's largest one (26+ or 10-25)
+    _p("cat_many_26", "state_first", {"line": MANY, "within": WITHIN}, **CAT),
+    _p("cat_many_10_25", "state_first", {"wh": MANY_LIST, "route": ROUTE}, state=JSON_STATE, **CAT),
+    _p("cat_many_both", "header", {"line": MANY, "wh": MANY_LIST, "route": ROUTE}, **CAT),
+    _p("cat_many_empty", "header", {"wh": MANY_LIST}, state="", **CAT),
+    _p("cat_dec_many", "header", {"wh": MANY_LIST, "within": WITHIN}, state=CONV_STATE, **CAT, **DEC),
+    # with a second read: each question's own temperature in its second read
+    _p("cat_twice", "header", ALL6, reread=RR_ALL, **CAT),
+    _p("cat_twice_threshold", "state_first", {"route": ROUTE, "within": WITHIN, "two": TWO, "seven": SEVEN},
+       state=JSON_STATE, reread=RR, **CAT),
+    _p("cat_twice_replace_conv", "hybrid_header", {"route": ROUTE, "within": WITHIN}, state=CONV_STATE,
+       reread={**RR_ALL, "combine": "replace"}, **CAT),
+    _p("cat_sandwich", "header", {"route": ROUTE, "within": WITHIN}, reread={**RR_ALL, "layout": "sandwich"}, **CAT),
+    _p("cat_rotate", "state_first", ALL6, reread=RRO, **CAT),
+    _p("cat_rotate_replace_json", "header", {"route": ROUTE, "within": WITHIN, "seven": SEVEN, "two": TWO},
+       state=JSON_STATE, reread=RRO_REPLACE, **CAT),
+    _p("cat_rotate_empty", "state_first", {"route": ROUTE, "within": WITHIN}, state="", reread=RRO, **CAT),
+    _p("cat_rotate_threshold", "header", ALL6, reread={**RR, "layout": "rotate"}, **CAT),
+    _p("cat_reverse", "header", {"route": ROUTE, "within": WITHIN, "seven": SEVEN}, state=CONV_STATE, reread=RRV, **CAT),
+    _p("cat_env_rotate", "hybrid_header", {"route": ROUTE, "within": WITHIN, "seven": SEVEN}, env="1.01,rotate,3000",
+       **CAT),
+    _p("cat_dec_rotate", "header", {"route": ROUTE, "within": WITHIN, "seven": SEVEN}, state=JSON_STATE,
+       reread=RRO_REPLACE, **CAT, **DEC),
+    _p("cat_dec_twice", "state_first", {"route": ROUTE, "within": WITHIN, "two": TWO}, state=CONV_STATE,
+       reread=RR_ALL, **CAT, **DEC),
+    _p("cat_many_rotate", "header", {"line": MANY, "route": ROUTE, "within": WITHIN}, reread=RRO, **CAT),
+    # with the pair read: the adapter read takes the model's categories, the base read the pair's (or none)
+    _p("cat_pair", None, {"route": ROUTE, "within": WITHIN, "severe": SEVERE, "two": TWO}, adapter=True, **CAT,
+       **PAIRC),
+    _p("cat_pair_json", "header", {"route": ROUTE, "within": WITHIN, "severe": SEVERE}, state=JSON_STATE, adapter=True,
+       **CAT, **PAIRC25),
+    _p("cat_pair_without_pair_cats", None, {"route": ROUTE, "within": WITHIN, "severe": SEVERE}, adapter=True, **CAT,
+       **PAIR),
+    _p("cat_pair_only_pair_cats", None, {"route": ROUTE, "within": WITHIN, "severe": SEVERE}, adapter=True, **PAIRC),
+    _p("cat_pair_rotate", "header", {"route": ROUTE, "within": WITHIN, "seven": SEVEN}, reread=RRO, adapter=True,
+       **CAT, **PAIRC),
+    _p("cat_pair_twice_commit", "state_first", {"route": ROUTE, "within": WITHIN}, state="", reread=RR_ALL,
+       adapter=True, **CAT, **PAIRC25, **COMMIT),
+    _p("cat_pair_many", "header", {"line": MANY, "within": WITHIN}, adapter=True, **CAT, **PAIRC),
+    _p("cat_pair_dec_rotate", "state_first", {"route": ROUTE, "within": WITHIN, "two": TWO}, state=CONV_STATE,
+       reread=RRO_REPLACE, adapter=True, **CAT, **PAIRC, **DEC),
+    # offline reads: a request's own option order sets its bin (ROUTE read with two options is "choice:2")
+    _d("cat_dist", "header", [(TEXT_STATE, ROUTE, None), (JSON_STATE, WITHIN, None), (CONV_STATE, SEVERE, None),
+                              (JSON_STATE, ROUTE, ["close", "refund"]), (None, WITHIN, None), ("", ROUTE, None),
+                              (TEXT_STATE, SEVEN, None), (JSON_STATE, SEVEN, None), (TEXT_STATE, TWELVE, None)],
+       **CAT),
+    _d("cat_dist_rotate", "hybrid_header", [(TEXT_STATE, ROUTE, None), (TEXT_STATE, SEVEN, None),
+                                            (JSON_STATE, WITHIN, None), (CONV_STATE, ROUTE, ["escalate", "close", "refund"]),
+                                            ("", WITHIN, None)], reread=RRO, **CAT),
+    _d("cat_dist_twice_ungrouped", "state_first", [(TEXT_STATE, ROUTE, None), (JSON_STATE, WITHIN, None),
+                                                   (None, TWO, None)], reread=RR_ALL, group_states=False, **CAT),
+    _d("cat_dist_uncalibrated", "header", [(TEXT_STATE, ROUTE, None), (JSON_STATE, WITHIN, None)], reread=RRO,
+       calibrated=False, **CAT),
+    _d("cat_dist_pair_rotate", "header", [(TEXT_STATE, ROUTE, None), (JSON_STATE, WITHIN, None),
+                                          (TEXT_STATE, SEVERE, None), ("", ROUTE, ["close", "refund"])],
+       reread=RRO, adapter=True, **CAT, **PAIRC),
+    _d("cat_dist_dec", "header", [(ARRAY_STATE, ROUTE, None), (ARRAY_STATE, WITHIN, None), (TEXT_STATE, SCORE5, None),
+                                  (ARRAY_STATE, SCORE5, None), (CONV_STATE, BARE_NOUL, None)], reread=RR_ALL,
+       **CAT, **DEC),
+]
+CASES = CASES + CATEGORY_CASES
+
+
+# ---- the "rotate" second read (1.6.0): the first read's prompt with the options rotated by half (the first len // 2
+# moved to the end), mapped back by label, then averaged in or put in place of the first read
+RRO_ALL_TYPES = {**RRO, "types": ["choice", "noul", "score"]}
+
+ROTATE_CASES = [
+    _p("rot_state_first_avg", None, {"route": ROUTE, "seven": SEVEN, "within": WITHIN, "severe": SEVERE}, reread=RRO),
+    _p("rot_state_first_replace", "state_first", {"route": ROUTE, "seven": SEVEN, "within": WITHIN, "team": DICT_INSTR},
+       state=JSON_STATE, reread=RRO_REPLACE),
+    _p("rot_state_first_threshold", "state_first", {"route": ROUTE, "within": WITHIN, "team": DICT_INSTR},
+       state=JSON_STATE, reread={**RR, "layout": "rotate"}),
+    _p("rot_score", "state_first", {"severe": SEVERE, "urgent": SCORE5, "route": ROUTE}, reread=RRO_ALL_TYPES),
+    _p("rot_score_replace", "header", {"severe": SEVERE, "urgent": SCORE5, "within": WITHIN}, state=CONV_STATE,
+       reread={**RRO_ALL_TYPES, "combine": "replace"}),
+    _p("rot_two_options", "state_first", {"two": TWO, "within": WITHIN}, reread=RRO),
+    _p("rot_twelve", "header", {"twelve": TWELVE, "seven": SEVEN}, reread=RRO),
+    _p("rot_header_avg", "header", {"route": ROUTE, "within": WITHIN, "severe": SEVERE, "team": DICT_INSTR}, reread=RRO),
+    _p("rot_header_replace", "header", {"route": ROUTE, "seven": SEVEN, "within": WITHIN}, state=CONV_STATE,
+       reread=RRO_REPLACE),
+    _p("rot_hybrid_one", "hybrid_header", {"seven": SEVEN}, reread=RRO),
+    _p("rot_hybrid_multi_replace", "hybrid_header", {"route": ROUTE, "within": WITHIN}, reread=RRO_REPLACE),
+    _p("rot_hybrid_same_instructions", "hybrid_header", {"a": ROUTE, "b": ROUTE_LIST}, reread=RRO),
+    _p("rot_many", "header", {"line": MANY, "route": ROUTE, "within": WITHIN}, reread=RRO),
+    _p("rot_max_tokens", "state_first", {"route": ROUTE, "within": WITHIN}, reread={**RRO, "max_tokens": 90}),
+    _p("rot_env_header", "header", {"route": ROUTE, "seven": SEVEN, "within": WITHIN}, env="1.01,rotate,3000"),
+    _p("rot_env_over_config", "state_first", {"route": ROUTE, "within": WITHIN}, reread=RRV, env="1.01,rotate,,replace"),
+    _p("rot_dec_state_first_avg", "state_first", {"route": ROUTE, "seven": SEVEN, "within": WITHIN, "severe": SEVERE,
+                                                  "team": DICT_INSTR}, reread=RRO, **DEC),
+    _p("rot_dec_header_replace", "header", {"route": ROUTE, "within": WITHIN, "severe": SEVERE}, state=ARRAY_STATE,
+       reread=RRO_REPLACE, **DEC),
+    _p("rot_dec_header_avg", "header", {"route": ROUTE, "seven": SEVEN, "within": WITHIN}, reread=RRO, **DEC),
+    _p("rot_dec_score", "state_first", {"severe": SEVERE, "urgent": SCORE5}, state=CONV_STATE, reread=RRO_ALL_TYPES,
+       **DEC),
+    _p("rot_dec_hybrid_same_instructions", "hybrid_header", {"a": ROUTE, "b": ROUTE_LIST}, reread=RRO, **DEC),
+    _p("rot_pair", "header", {"route": ROUTE, "seven": SEVEN, "within": WITHIN}, reread=RRO, adapter=True, **PAIR),
+    _d("rot_dist_header", "header", [(TEXT_STATE, ROUTE, None), (JSON_STATE, WITHIN, None), (TEXT_STATE, SEVEN, None),
+                                     (JSON_STATE, ROUTE, ["close", "escalate", "replace"])], reread=RRO),
+    _d("rot_dist_state_first_ungrouped", "state_first", [(TEXT_STATE, ROUTE, None), (JSON_STATE, WITHIN, ["no", "yes"]),
+                                                         (TEXT_STATE, SEVERE, None)],
+       reread={**RRO_ALL_TYPES, "combine": "replace"}, group_states=False),
+    _d("rot_dist_dec_hybrid_replace", "hybrid_header", [(TEXT_STATE, ROUTE, None), (TEXT_STATE, SEVEN, None),
+                                                        (ARRAY_STATE, WITHIN, None), (CONV_STATE, BARE_NOUL, None),
+                                                        (ARRAY_STATE, WITHIN, ["yes", "no"])],
+       reread=RRO_REPLACE, **DEC),
+]
+CASES = CASES + ROTATE_CASES
+
+
 # ---- the shared-prefix read: every case above with it on, plus states longer than the tiny model's 64-token sliding
 # window (so the cached prefix crosses it) -----------------------------------------------------------------------------
 LONG_STATE = " ".join(f"Parcel {i} weighs {i % 7} kg and goes to depot {i % 3}." for i in range(30))
@@ -330,6 +481,27 @@ PREFIX_EXTRA += [   # the reverse second read and the pair read, long states
     _d("long_pair_dist_header", "header", [(LONG_STATE, ROUTE, None), (LONG_STATE, WITHIN, None),
                                            (LONG_JSON, SEVERE, None), (TEXT_STATE, WITHIN, None)],
        reread=RRV, adapter=True, **PAIR),
+]
+PREFIX_EXTRA += [   # temperatures per category and the rotate second read, long states
+    _p("long_cat_header", "header", ALL6, state=LONG_STATE, **CAT),
+    _p("long_cat_json_many", "state_first", {"line": MANY, "wh": MANY_LIST, "route": ROUTE, "within": WITHIN},
+       state=LONG_JSON, **CAT),
+    _p("long_cat_twice", "hybrid_header", {"route": ROUTE, "within": WITHIN, "seven": SEVEN}, state=LONG_JSON,
+       reread=RR_ALL, **CAT),
+    _p("long_rot_header", "header", {"route": ROUTE, "seven": SEVEN, "within": WITHIN, "severe": SEVERE},
+       state=LONG_STATE, reread=RRO),
+    _p("long_rot_dec_state_first_replace", "state_first", {"route": ROUTE, "seven": SEVEN, "within": WITHIN,
+                                                           "team": DICT_INSTR}, state=LONG_JSON, reread=RRO_REPLACE,
+       **DEC),
+    _p("long_rot_score_many", "header", {"line": MANY, "severe": SEVERE, "urgent": SCORE5, "within": WITHIN},
+       state=LONG_STATE, reread=RRO_ALL_TYPES),
+    _p("long_cat_rot_pair", "header", {"route": ROUTE, "within": WITHIN, "seven": SEVEN}, state=LONG_STATE,
+       reread=RRO, adapter=True, **CAT, **PAIRC),
+    _p("long_cat_dec_rotate", "header", {"a": ROUTE, "b": ROUTE_LIST, "within": WITHIN}, state=LONG_JSON,
+       reread=RRO, **CAT, **DEC),
+    _d("long_cat_dist_rotate", "header", [(LONG_STATE, ROUTE, None), (LONG_STATE, SEVEN, None),
+                                          (LONG_JSON, WITHIN, None), (LONG_JSON, SEVERE, None), (TEXT_STATE, WITHIN, None)],
+       reread=RRO, **CAT),
 ]
 PREFIX_CASES = CASES + PREFIX_EXTRA
 

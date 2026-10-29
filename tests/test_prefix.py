@@ -349,3 +349,17 @@ def test_pair_and_reverse_reads_go_through_the_shared_prefix():
     for name in ("long_rev_header", "rev_header_avg"):
         r = g[name]
         assert len(r["letter_reads"]) == 2 and r["letter_reads"][1]["prefix"] == r["prefix"][0] > 0
+
+
+def test_rotate_and_category_reads_go_through_the_shared_prefix():
+    """1.6.0: a rotate second read starts with the first read's prefix and reads against it; categories change no read
+    (each member of a pair read with categories prepares the request's prefix)."""
+    g = GOLDEN["cases"]
+    for name in ("long_rot_header", "rot_header_avg", "long_rot_score_many", "long_cat_dec_rotate"):
+        r = g[name]
+        assert r["prefix"][0] > 0 and r["letter_reads"][1]["prefix"] == r["prefix"][0] and not r["reads"]
+    for name in ("long_cat_rot_pair", "cat_pair_rotate"):
+        r = g[name]
+        assert len(r["prefix"]) == 2 and r["prefix"][0] == r["prefix"][1] > 0 and not r["reads"]
+        assert all(x["prefix"] == r["prefix"][0] for x in r["letter_reads"]) and r["usage"]["pair"] == 2
+    assert [x["n_options"] for x in g["long_cat_json_many"]["letter_reads"]] == [[4, 2], [14, 14, 12, 10, 10], [3, 2]]

@@ -134,3 +134,94 @@ def test_deadline_shortens_skips_and_cuts_the_reasoning():
     m._deadline = time.monotonic() + 3.0
     assert m._apply_think(["noul"], [["yes", "no"]], [[1, 2]], [[0.0, 0.0]], probs) == [30]   # tokens paid for
     assert probs == [[0.5, 0.5]] and m.deadline_stats["cut"] == 1
+
+
+# ---- --noul-commit (1.6.0): the yes/no commit band set at start-up -------------------------------------------------
+
+def _serve(tiny_model_dir, tmp_path, monkeypatch, capsys, cfg, *flags):
+    """chon.serve.main on a copy of the tiny model with this chon_config.json: (a test client, the start line)."""
+    import json
+    import shutil
+
+    import uvicorn
+
+    from chon.serve import main
+
+    d = tmp_path / f"m{len(list(tmp_path.iterdir()))}"
+    shutil.copytree(tiny_model_dir, d)
+    (d / "chon_config.json").write_text(json.dumps(cfg))
+    apps = []
+    monkeypatch.setattr(uvicorn, "run", lambda app, **kw: apps.append(app))
+    capsys.readouterr()
+    main(["--model", str(d), "--device", "cpu", "--dtype", "float32", "--deadline", "0", *flags])
+    start = next(x for x in capsys.readouterr().out.splitlines() if x.startswith("[serve] ") and " on cpu" in x)
+    return TestClient(apps[0]), start
+
+
+def test_noul_commit_flag_serves_as_the_config_key(tiny_model_dir, tmp_path, monkeypatch, capsys):
+    """--noul-commit LO,HI changes a served yes/no answer exactly as chon_config.json "noul_commit" does, and
+    --noul-commit off removes a config's band; /health and the start line say which band is served."""
+    import pytest
+
+    from chon.dindex import ChonEngine
+
+    monkeypatch.delenv("CHON_REREAD", raising=False)
+    temps = {"temperatures": {"choice": 0.9, "noul": 1.2, "score": 0.7}}
+    body = {"state": "Parcel 7: weight 5 kg, limit 4 kg. The customer asks for a refund and is upset.",
+            "questions": {"within": {"type": "noul", "instructions": "Is the parcel within the limit?",
+                                     "criteria": {"true": "weight <= limit", "false": "weight > limit"}}}}
+
+    def served(cfg, *flags):
+        c, start = _serve(tiny_model_dir, tmp_path, monkeypatch, capsys, cfg, *flags)
+        return c.post("/v1/systemone", json=body).json()["answers"]["within"], c.get("/health").json(), start
+
+    plain, h_plain, s_plain = served(temps)
+    assert 0.2 < plain["noul"] < 0.8 and h_plain["noul_commit"] is None and s_plain.endswith(", no yes/no commit band")
+    by_cfg, h_cfg, s_cfg = served({**temps, "noul_commit": [0.199, 0.801]})
+    by_flag, h_flag, s_flag = served(temps, "--noul-commit", "0.199,0.801")
+    assert by_flag == by_cfg and by_flag["noul"] == (0.801 if plain["noul"] >= 0.5 else 0.199)
+    assert h_flag["noul_commit"] == h_cfg["noul_commit"] == [0.199, 0.801]
+    assert s_flag.endswith(", yes/no commit band 0.199/0.801") and s_cfg == s_flag
+    wide, _, _ = served({**temps, "noul_commit": [0.199, 0.801]}, "--noul-commit", "0.1,0.9")   # the flag wins
+    assert wide["noul"] == (0.9 if plain["noul"] >= 0.5 else 0.1)
+    off, h_off, s_off = served({**temps, "noul_commit": [0.199, 0.801]}, "--noul-commit", "off")
+    assert off == plain and h_off["noul_commit"] is None and s_off.endswith(", no yes/no commit band")
+    for bad in ("0.6,0.9", "0.1,0.4", "0,0.8", "0.2,1", "0.2", "x,y"):
+        with pytest.raises(SystemExit):
+            served(temps, "--noul-commit", bad)
+    # the Decision Index engine: --option noul_commit=LO,HI the same; true keeps the config's; off by default
+    d = tmp_path / "engine"
+    import json
+    import shutil
+    shutil.copytree(tiny_model_dir, d)
+    (d / "chon_config.json").write_text(json.dumps(temps))
+    state, qs = body["state"], body["questions"]
+    e = ChonEngine(model=str(d), device="cpu")      # (the engine reads in bfloat16: its own numbers)
+    e_plain = e(state, qs)[0]["answers"]["within"]
+    assert 0.2 < e_plain["noul"] < 0.8 and e.provenance["noul_commit_band"] is None
+    assert "commit band" not in e.provenance["policy"]
+    e = ChonEngine(model=str(d), device="cpu", noul_commit="0.199,0.801")
+    e_band = e(state, qs)[0]["answers"]["within"]
+    assert e_band["noul"] == (0.801 if e_plain["noul"] >= 0.5 else 0.199) and e_band["noul"] == by_flag["noul"]
+    assert e.provenance["noul_commit_band"] == [0.199, 0.801] and e.provenance["noul_commit"] is True
+    assert "served as 0.199 or 0.801" in e.provenance["policy"]
+    (d / "chon_config.json").write_text(json.dumps({**temps, "noul_commit": [0.199, 0.801]}))
+    assert ChonEngine(model=str(d), device="cpu", noul_commit="true")(state, qs)[0]["answers"]["within"] == e_band
+    assert ChonEngine(model=str(d), device="cpu", noul_commit="false")(state, qs)[0]["answers"]["within"] == e_plain
+    assert ChonEngine(model=str(d), device="cpu")(state, qs)[0]["answers"]["within"] == e_plain   # board default
+    with pytest.raises(ValueError, match="needs 0 < LO < 0.5 < HI < 1"):
+        ChonEngine(model=str(d), device="cpu", noul_commit="0.3,0.4")
+
+
+def test_parse_noul_commit():
+    import pytest
+
+    from chon.infer import parse_noul_commit
+
+    assert parse_noul_commit("0.199,0.801") == (0.199, 0.801) == parse_noul_commit([0.199, 0.801])
+    assert parse_noul_commit(" 0.1 , 0.9 ") == (0.1, 0.9)
+    for off in ("off", "OFF", "none", "false", "0", ""):
+        assert parse_noul_commit(off) is None
+    for bad in ("0.5,0.8", "0.2,0.5", "-0.1,0.8", "0.2,1.0", "0.2", "0.1,0.5,0.9", "a,b", 0.2, None):
+        with pytest.raises(ValueError):
+            parse_noul_commit(bad)

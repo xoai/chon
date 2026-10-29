@@ -634,7 +634,9 @@ def test_dindex_and_health_state_the_pair_read(tiny_dm, tiny_model_dir, tmp_path
     assert out["usage"]["pair"] == 2 and set(out["answers"]) == {"a", "b"}
     h = TestClient(create_app(e.dm, None)).get("/health").json()
     assert h["pair"] == {"weight": 0.25, "temperatures": PAIR_T}
-    p = ChonEngine(model=d, device="cpu", noul_commit=True).provenance
+    p = ChonEngine(model=d, device="cpu", noul_commit=True).provenance   # (this config sets no band: none to run)
+    assert "the yes/no commit band" not in p["policy"] and p["noul_commit_band"] is None
+    p = ChonEngine(model=d, device="cpu", noul_commit="0.199,0.801").provenance
     assert "post-calibration, the yes/no commit band) run once on the average" in p["policy"]
     plain = tmp_path / "plain"
     shutil.copytree(tiny_model_dir, plain)
@@ -642,3 +644,256 @@ def test_dindex_and_health_state_the_pair_read(tiny_dm, tiny_model_dir, tmp_path
     e = ChonEngine(model=str(plain), device="cpu")
     assert e.provenance["pair"] is None and "read twice" not in e.provenance["policy"] and e.latency == ChonEngine.latency
     assert TestClient(create_app(e.dm, None)).get("/health").json()["pair"] is None
+
+
+# ---- temperatures per category and the rotate second read (1.6.0) -------------------------------------------------
+
+def test_category_and_rotate_cases_cover_what_they_claim():
+    from parity_cases import CATS
+
+    g = GOLDEN["cases"]
+    # every bin read: 2, 3-4, 5-9, 10-25 (a plain read of 12 options, a two-round read of 20), 26+ (two rounds of 40)
+    assert g["cat_text"]["reads"][0]["n_options"] == [4, 2, 3, 2, 7, 12, 5]
+    assert [r["n_options"] for r in g["cat_many_10_25"]["reads"]][1:] == [[10, 10], [2]]
+    assert [r["n_options"] for r in g["cat_many_26"]["reads"]][1:] == [[14, 14, 12], [3]]
+    assert {k.split(":")[1] for k in CATS} == {"2", "3-4", "5-9", "10-25", "26+"}
+    assert {k.split(":")[2] for k in CATS if k.count(":") == 2} == {"text", "json", "empty"}
+    # second reads with categories, and rotate reads: choice (even and odd), yes/no and score
+    for name, n in (("cat_twice", 5), ("cat_rotate", 5), ("cat_rotate_threshold", 2), ("cat_pair_rotate", 3),
+                    ("rot_state_first_avg", 3), ("rot_score", 3), ("rot_dec_score", 2), ("rot_hybrid_one", 1)):
+        assert g[name]["usage"]["reread"] == n, name
+    for name in ("rot_header_avg", "rot_env_header", "rot_dec_header_avg", "cat_env_rotate", "rot_pair"):
+        assert g[name]["reread"]["layout"] == "rotate"
+    assert g["rot_env_header"]["reread"]["max_tokens"] == 3000 and g["rot_env_over_config"]["reread"]["combine"] == \
+        "replace"
+    assert [r["n_options"] for r in g["rot_many"]["reads"]] == [[4, 2], [4, 2], [14, 14, 12], [3]]   # big: once
+    assert g["rot_score"]["reads"][1]["n_options"] == [3, 5, 4]
+    for name in ("cat_pair", "cat_pair_without_pair_cats", "cat_pair_only_pair_cats", "cat_pair_many"):
+        reads = g[name]["reads"]
+        assert reads[:len(reads) // 2] == reads[len(reads) // 2:] and g[name]["usage"]["pair"] == 2
+    # the categories reshape the probabilities, never the prompts: the adapter read takes the model's categories (a
+    # yes/no question with a text state has none: its type's), the base read the pair's own (none unless set)
+    w50, own, base = g["pair_w50"], g["cat_pair_without_pair_cats"], g["cat_pair_only_pair_cats"]
+    assert w50["reads"] == own["reads"] == base["reads"]
+    assert own["answers"]["within"] == w50["answers"]["within"]
+    assert own["answers"]["route"] != w50["answers"]["route"] and own["answers"]["severe"] != w50["answers"]["severe"]
+    assert all(base["answers"][q] != w50["answers"][q] for q in ("route", "within", "severe"))
+
+
+def test_category_helpers():
+    from chon.infer import category_keys, option_bin, parse_categories, parse_pair, reorder_options, state_kind
+
+    assert [option_bin(n) for n in (2, 3, 4, 5, 9, 10, 25, 26, 256)] == \
+        ["2", "3-4", "3-4", "5-9", "5-9", "10-25", "10-25", "26+", "26+"]
+    assert [state_kind(s) for s in (None, "", "  \n", "x", {"a": 1}, [{"role": "user", "content": "hi"}], 7)] == \
+        ["empty", "empty", "empty", "text", "json", "json", "json"]
+    assert category_keys("choice", 3, "x") == ["choice:3-4:text", "choice:3-4"]
+    assert category_keys("noul", 2, None) == ["noul:2:empty", "noul:2"]
+    assert reorder_options(["a", "b", "c", "d", "e"], "rotate") == ["c", "d", "e", "a", "b"]
+    assert reorder_options(["a", "b", "c", "d"], "rotate") == ["c", "d", "a", "b"]
+    assert reorder_options(["a", "b"], "rotate") == ["b", "a"] == reorder_options(["a", "b"], "reverse")
+    assert reorder_options(("a", "b", "c"), "reverse") == ["c", "b", "a"]
+    assert parse_categories(None) == {} and parse_categories({}) == {}
+    assert parse_categories({"choice:2": 1, 5: "0.5"}) == {"choice:2": 1.0, "5": 0.5}
+    with pytest.raises(ValueError, match="must be an object"):
+        parse_categories([["choice:2", 1.0]])
+    assert "temperature_categories" not in parse_pair({"weight": 0.5})        # a 1.5.0 setting reports as before
+    assert parse_pair({"temperature_categories": {"noul:2": 2}})["temperature_categories"] == {"noul:2": 2.0}
+
+
+def test_each_category_level_takes_its_temperature(tiny_dm):
+    """The most specific category set, then the options-only one, then the type's temperature: a calibrated read is
+    the uncalibrated one at that temperature, for every bin and state kind (as the training code's test does)."""
+    import math
+
+    from chon.infer import DecisionModel, softmax
+    from parity_cases import CAT, CONV_STATE, JSON_STATE, SCORE5, SEVEN, TEMPS, TWELVE, TWO
+
+    dm = DecisionModel(tiny_dm.model, tiny_dm.tok, {"temperatures": TEMPS, **CAT, "prefix_cache": False}, device="cpu")
+    want = [(TEXT_STATE, ROUTE, None, 1.9), (JSON_STATE, ROUTE, None, 0.6), (CONV_STATE, ROUTE, None, 0.6),
+            ("", ROUTE, None, 2.4), (None, ROUTE, None, 2.4), (JSON_STATE, ROUTE, ["close", "refund"], 1.55),
+            (TEXT_STATE, WITHIN, None, TEMPS["noul"]), (JSON_STATE, WITHIN, None, 0.45),
+            (CONV_STATE, WITHIN, None, 0.45), ("  \n", WITHIN, None, 2.2), (TEXT_STATE, SEVERE, None, 1.6),
+            (JSON_STATE, SCORE5, None, 0.65), (TEXT_STATE, SCORE5, None, TEMPS["score"]), (TEXT_STATE, TWO, None, 1.55),
+            (TEXT_STATE, SEVEN, None, 0.5), (JSON_STATE, SEVEN, None, TEMPS["choice"]), (TEXT_STATE, TWELVE, None, 0.7)]
+    reqs = [(s, q, o) for s, q, o, _ in want]
+    raw = dm.distributions(reqs, calibrated=False, think=False, group_states=False)
+    got = dm.distributions(reqs, think=False, group_states=False)
+    for (s, q, o, t), r, c in zip(want, raw, got):
+        order = list(r)
+        p = softmax([math.log(r[k]) for k in order], t)
+        assert all(abs(c[k] - x) < 1e-9 for k, x in zip(order, p)), (s, q["instructions"], t)
+    for s, q, o, t in want:
+        n = len(o) if o else len(dm.builder.natural_order(q))
+        assert dm._temp(q["type"], n, s) == t
+    ans, _ = dm.predict(JSON_STATE, {"w": WITHIN})        # the served path takes the same temperature
+    assert abs(ans["w"]["noul"] - got[7]["yes"]) < 1e-6
+
+
+def test_many_options_take_the_largest_category(tiny_dm):
+    """Both rounds of every choice over 16 options in a request read at the category of the request's largest one (the
+    training code's rule): MANY_LIST (20 options) with MANY (40) reads at "choice:26+", alone at "choice:10-25"."""
+    from chon.infer import DecisionModel
+    from parity_cases import MANY, MANY_LIST
+
+    def wh(cats, qs):
+        dm = DecisionModel(tiny_dm.model, tiny_dm.tok, {"temperature_categories": cats, "prefix_cache": False},
+                           device="cpu")
+        return dm.predict(TEXT_STATE, qs)[0]["wh"]["probabilities"]
+
+    both = {"line": MANY, "wh": MANY_LIST}
+    assert wh({"choice:26+": 1.8, "choice:10-25": 0.7}, both) == wh({"choice:26+": 1.8, "choice:10-25": 0.2}, both)
+    assert wh({"choice:26+": 1.8}, both) != wh({"choice:26+": 0.9}, both)
+    alone = {"wh": MANY_LIST}
+    assert wh({"choice:10-25": 0.7}, alone) != wh({"choice:10-25": 0.2}, alone)
+    assert wh({"choice:26+": 1.8, "choice:10-25": 0.7}, alone) == wh({"choice:26+": 0.3, "choice:10-25": 0.7}, alone)
+
+
+def test_rotated_read_is_the_mean_of_both_orders(tiny_dm, monkeypatch):
+    """A rotate second read averages the read in the first order and the read with the options rotated by half (and
+    "replace" keeps the rotated one), mapped back by label: odd and even option counts, at the category temperature."""
+    from chon.infer import DecisionModel, reorder_options
+    from parity_cases import CAT, SEVEN
+
+    monkeypatch.delenv("CHON_REREAD", raising=False)
+    plain = DecisionModel(tiny_dm.model, tiny_dm.tok, {"temperatures": PAIR_T, **CAT}, device="cpu")
+    for q in (ROUTE, SEVEN):
+        order = plain.builder.natural_order(q)
+        p1 = plain.distributions([(TEXT_STATE, q, order)])[0]
+        pr = plain.distributions([(TEXT_STATE, q, reorder_options(order, "rotate"))])[0]
+        assert p1 != pr
+        for combine, want in (("avg", {k: (p1[k] + pr[k]) / 2 for k in order}), ("replace", pr)):
+            monkeypatch.setenv("CHON_REREAD", f"1.01,rotate,100000,{combine}")
+            rv = DecisionModel(tiny_dm.model, tiny_dm.tok, {"temperatures": PAIR_T, **CAT}, device="cpu")
+            got = rv.distributions([(TEXT_STATE, q, order)])[0]
+            assert list(got) == order and all(abs(got[k] - want[k]) < 1e-6 for k in order)
+
+
+def test_rotate_prompts_read_as_documented(tiny_dm):
+    from chon.prompt import DEC_HEADER, HEADER_LINE, REREAD_LINE
+
+    first, second = _decoded(tiny_dm, "rot_header_avg", call=0), _decoded(tiny_dm, "rot_header_avg", call=1)
+    pos = lambda text, labs: [text.index(f"{lab} —") for lab in labs]
+    assert pos(first, ["refund", "replace", "escalate", "close"]) == sorted(pos(first, ["refund", "replace",
+                                                                                         "escalate", "close"]))
+    assert pos(second, ["escalate", "close", "refund", "replace"]) == sorted(pos(second, ["refund", "replace",
+                                                                                           "escalate", "close"]))
+    assert "A) escalate — " in second and "D) replace — " in second
+    assert second.count(HEADER_LINE) == 1 and REREAD_LINE not in second and second.count(TEXT_STATE) == 1
+    assert first.split("Question:")[0] == second.split("Question:")[0]
+    seven = _decoded(tiny_dm, "rot_hybrid_one", call=1)            # 7 options: the first 3 moved to the end
+    labs = ["green", "blue", "indigo", "violet", "red", "orange", "yellow"]
+    assert pos(seven, labs) == sorted(pos(seven, labs)) and "A) green — " in seven and HEADER_LINE not in seven
+    dec = _decoded(tiny_dm, "rot_dec_header_avg", call=1, row=1)  # decider: the rotated letters, one header
+    assert "(A) green: the parcel is green\n" in dec and "(G) yellow: the parcel is yellow" in dec
+    assert dec.count(DEC_HEADER) == 1
+    yn = _decoded(tiny_dm, "rot_dec_header_avg", call=1, row=2)   # two options: rotated = swapped
+    assert "(A) yes: weight <= limit\n(B) no: weight > limit<end_of_turn>" in yn
+    sc = _decoded(tiny_dm, "rot_score", call=1, row=1)             # a score of 5: 2, 3, 4, 0, 1
+    assert sc.index("A) 2 — some") < sc.index("C) 4 — top") < sc.index("D) 0 — none") < sc.index("E) 1 — low")
+
+
+def test_no_new_keys_read_as_before(tiny_dm, monkeypatch):
+    """A config without temperature_categories reads every question at its type's temperature (1.5.0)."""
+    from chon.infer import DecisionModel
+
+    monkeypatch.delenv("CHON_REREAD", raising=False)
+    dm = DecisionModel(tiny_dm.model, tiny_dm.tok, {"temperatures": {"choice": 1.3}}, device="cpu")
+    assert dm.temperature_categories == {} and dm._temp("choice", 30, "x") == 1.3 and dm._temp("noul", 2, None) == 1.0
+    stub = object.__new__(DecisionModel)    # built without __init__: the type's temperature
+    stub.temperatures = {"choice": 0.7}
+    assert stub._temp("choice", 3, "x") == 0.7
+
+
+def test_rotate_and_category_settings_and_refusals(tiny_dm, monkeypatch):
+    from chon.infer import DecisionModel, parse_reread
+    from parity_cases import PAIRC
+
+    monkeypatch.delenv("CHON_REREAD", raising=False)
+    assert parse_reread(None, "1.01,rotate,3000")["layout"] == "rotate"
+    assert parse_reread({"below": 0.9, "layout": "rotate", "combine": "replace"})["combine"] == "replace"
+    with pytest.raises(ValueError, match="unknown reread layout"):
+        parse_reread(None, "0.9,rotated")
+    assert DecisionModel(tiny_dm.model, tiny_dm.tok, {**DEC, "reread": {**RR_ALL, "layout": "rotate"}},
+                         device="cpu").reread["layout"] == "rotate"
+    with pytest.raises(ValueError, match="'twice', 'reverse' or 'rotate'"):
+        DecisionModel(tiny_dm.model, tiny_dm.tok, {**DEC, "reread": {**RR_ALL, "layout": "sandwich"}}, device="cpu")
+    with pytest.raises(ValueError, match="temperature_categories must be an object"):
+        DecisionModel(tiny_dm.model, tiny_dm.tok, {"temperature_categories": 1.2}, device="cpu")
+    # the base member of a pair read swaps in the pair's categories and puts the model's back afterwards
+    dm = DecisionModel(adapter_model(tiny_dm.model), tiny_dm.tok, {"temperature_categories": {"choice:3-4": 2.0},
+                                                                    **PAIRC}, device="cpu")
+    with dm._member(base=True):
+        assert dm.temperature_categories == PAIRC["pair"]["temperature_categories"] and dm.temperatures == PAIR_T
+    with dm._member(base=False):
+        assert dm.temperature_categories == {"choice:3-4": 2.0}
+    assert dm.temperature_categories == {"choice:3-4": 2.0}
+
+
+def test_categories_and_rotate_load_from_a_model_folder(tiny_dm, tiny_model_dir, tmp_path, monkeypatch, fixture_ok,
+                                                        adapter_ok):
+    """chon_config.json's temperature_categories and a rotate second read (config or $CHON_REREAD), read by
+    DecisionModel.load, give the golden reads and answers; a pair package with both too."""
+    from chon.infer import DecisionModel
+
+    monkeypatch.delenv("CHON_REREAD", raising=False)
+    for name in ("cat_text", "cat_rotate_replace_json", "rot_env_header", "cat_env_rotate", "cat_many_both"):
+        case = BY_NAME[name]
+        d = tmp_path / name
+        shutil.copytree(tiny_model_dir, d)
+        (d / "chon_config.json").write_text(json.dumps({**case["cfg"], "prefix_cache": False}))
+        if case["env"]:
+            monkeypatch.setenv("CHON_REREAD", case["env"])
+        dm = DecisionModel.load(str(d), device="cpu", dtype="float32")
+        monkeypatch.delenv("CHON_REREAD", raising=False)
+        assert dm.temperature_categories == case["cfg"].get("temperature_categories", {})
+        seen = []
+        real = dm.raw_logits
+        dm.raw_logits = lambda seqs, n, letter_ids=None: (seen.append([list(s) for s in seqs]), real(seqs, n))[1]
+        answers, usage = dm.predict(case["state"], case["questions"])
+        want = GOLDEN["cases"][name]
+        assert seen == [r["ids"] for r in want["reads"]] and dm.reread == want["reread"]
+        usage.pop("forward_s")
+        assert usage == want["usage"]
+        if fixture_ok:
+            _same_outputs(answers, want["answers"], name)
+    for name in ("cat_pair_rotate", "cat_pair_twice_commit"):
+        case = BY_NAME[name]
+        d = _adapter_package(tiny_dm, tiny_model_dir, tmp_path / name, {**case["cfg"], "prefix_cache": False})
+        dm = DecisionModel.load(d, device="cpu", dtype="float32")
+        assert hasattr(dm.model, "disable_adapter") and dm.pair["temperature_categories"]
+        answers, usage = dm.predict(case["state"], case["questions"])
+        usage.pop("forward_s")
+        assert usage == GOLDEN["cases"][name]["usage"]
+        if fixture_ok and adapter_ok:
+            _same_outputs(answers, GOLDEN["cases"][name]["answers"], name)
+
+
+def test_dindex_and_health_state_categories_and_rotate(tiny_dm, tiny_model_dir, tmp_path, monkeypatch):
+    from fastapi.testclient import TestClient
+
+    from chon.dindex import ChonEngine
+    from chon.serve import create_app
+    from parity_cases import CATS, PAIR_CATS, PAIRC
+
+    monkeypatch.delenv("CHON_REREAD", raising=False)
+    d = tmp_path / "pkg"
+    shutil.copytree(tiny_model_dir, d)
+    (d / "chon_config.json").write_text(json.dumps({"temperature_categories": CATS,
+                                                    "reread": {"below": 0.8, "layout": "rotate"}}))
+    e = ChonEngine(model=str(d), device="cpu")
+    p = e.provenance
+    assert p["temperature_categories"] == CATS and p["reread"]["layout"] == "rotate"
+    assert f"most specific category ({len(CATS)} set" in p["policy"] and "26+" in p["policy"]
+    assert "'rotate' layout (the first read's prompt with the options rotated by half" in p["policy"]
+    out, _ = e(TEXT_STATE, {"a": ROUTE, "b": WITHIN})
+    assert set(out["answers"]) == {"a", "b"}
+    h = TestClient(create_app(e.dm, None)).get("/health").json()
+    assert h["temperature_categories"] == len(CATS) and h["reread"]["layout"] == "rotate"
+    pkg = _adapter_package(tiny_dm, tiny_model_dir, tmp_path / "pair", {"temperature_categories": CATS, **PAIRC})
+    p = ChonEngine(model=pkg, device="cpu").provenance
+    assert p["pair"]["temperature_categories"] == PAIR_CATS and f"and {len(PAIR_CATS)} per category" in p["policy"]
+    (d / "chon_config.json").write_text("{}")
+    e = ChonEngine(model=str(d), device="cpu")
+    assert e.provenance["temperature_categories"] is None and "category" not in e.provenance["policy"]
+    assert TestClient(create_app(e.dm, None)).get("/health").json()["temperature_categories"] == 0
