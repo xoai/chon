@@ -23,12 +23,12 @@ class _Mod:
 @pytest.fixture
 def small_budget():
     attention.install()
-    attention.set_budget(4096)            # a few rows per chunk for these sizes
+    attention.set_budget(4 * 97 * 160 * 4 // 3)   # a few chunks for these sizes
     yield
     attention.set_budget(None)
 
 
-def _qkv(b=1, h=4, kvh=4, q=97, kv=97, d=16, seed=0):
+def _qkv(b=1, h=4, kvh=4, q=97, kv=97, d=272, seed=0):   # wider than the fused kernels take, as Gemma 4's 512
     g = torch.Generator().manual_seed(seed)
     return (torch.randn(b, h, q, d, generator=g), torch.randn(b, kvh, kv, d, generator=g),
             torch.randn(b, kvh, kv, d, generator=g))
@@ -70,12 +70,20 @@ def test_small_calls_take_the_original_path():
     before = attention.stats()["chunked_calls"]
     ALL_ATTENTION_FUNCTIONS["sdpa"](_Mod(), q, k, v, None, 0.0, None, None)
     assert attention.stats()["chunked_calls"] == before
+    attention.set_budget(64)                  # heads the fused kernels take are never chunked, whatever the budget
+    try:
+        q, k, v = _qkv(q=97, kv=97, d=64)
+        ALL_ATTENTION_FUNCTIONS["sdpa"](_Mod(), q, k, v, None, 0.0, None, None)
+        assert attention.stats()["chunked_calls"] == before
+    finally:
+        attention.set_budget(None)
     assert attention.chunk_rows(1, 32, 20000, 2 ** 30) == 2 ** 30 // (32 * 20000 * 4)
     assert attention.chunk_rows(1, 32, 10 ** 9, 2 ** 20) == 64
 
 
-def test_a_whole_request_reads_the_same_in_chunks(tiny_dm):
+def test_a_whole_request_reads_the_same_in_chunks(tiny_dm, monkeypatch):
     attention.install()
+    monkeypatch.setattr(attention, "FUSED_MAX_HEAD_DIM", 0)   # the tiny model's heads are narrow
     attention.set_budget(None)
     want, _ = tiny_dm.predict(STATE, Q)
     attention.set_budget(1024)
@@ -121,9 +129,12 @@ def test_engine_retries_a_request_that_ran_out_of_memory(tiny_model_dir, tmp_pat
         raise torch.OutOfMemoryError("CUDA out of memory.")
 
     monkeypatch.setattr(e.dm, "predict", always)
-    with pytest.raises(torch.OutOfMemoryError):                       # a second failure is the request's error
+    from decision_index.engines.base import Unsupported
+    with pytest.raises(Unsupported, match="out of GPU memory"):     # a second failure: unsupported, the run goes on
         e(STATE, Q)
-    assert e.dm.max_batch_tokens == 32768
+    assert e.dm.max_batch_tokens == 32768 and e.oom_unsupported == 1
+    from chon import prefix
+    assert prefix.prefill_chunk() == prefix.DEFAULT_PREFILL_CHUNK
 
     def other(state, questions, **kw):
         raise ValueError("not memory")
@@ -133,3 +144,36 @@ def test_engine_retries_a_request_that_ran_out_of_memory(tiny_model_dir, tmp_pat
         e(STATE, Q)
     assert "expandable_segments" in __import__("os").environ.get("PYTORCH_CUDA_ALLOC_CONF", "")
     assert "query chunks" in e.provenance["policy"]
+
+
+# ---- a long prompt fills the cache in chunks (1.5.2) ---------------------------------------------------------------
+
+LONG_STATE = " ".join(f"line {i}: parcel {i % 7} weighed {i * 3 % 11} kg, status {'late' if i % 5 == 0 else 'ok'}."
+                      for i in range(60))
+
+
+@pytest.mark.parametrize("questions", [Q, {"route": Q["route"]}], ids=["two_questions_shared_prefix", "one_question"])
+def test_chunked_prefill_reads_the_same(tiny_dm, questions):
+    from chon import prefix
+    prefix.set_prefill_chunk(0)
+    try:
+        want, _ = tiny_dm.predict(LONG_STATE, questions)
+        prefix.set_prefill_chunk(7)            # far smaller than the prompt and the tiny model's window
+        calls = []
+        real = prefix.SharedPrefix.__init__
+
+        def spy(self, model, tokens, device):
+            calls.append(len(tokens))
+            return real(self, model, tokens, device)
+
+        prefix.SharedPrefix.__init__ = spy
+        try:
+            got, _ = tiny_dm.predict(LONG_STATE, questions)
+        finally:
+            prefix.SharedPrefix.__init__ = real
+    finally:
+        prefix.set_prefill_chunk(None)
+    assert calls and max(calls) > 7                      # a prefix longer than the chunk went through in chunks
+    for n in questions:
+        for o, p in want[n]["probabilities"].items():
+            assert abs(got[n]["probabilities"][o] - p) < 1e-5

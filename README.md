@@ -202,20 +202,27 @@ kinds of questions, and the pair read combines them.
 **Version 1.4.0 and older ignore `"pair"`** (they read the adapter alone, merged), so serve a model that sets it with
 1.5.0 or newer. A config without `"pair"` or `"reverse"` reads exactly as in 1.4.0.
 
-### Long prompts on a 96 GB card (1.5.1)
+### Long prompts on a 96 GB card (1.5.1, 1.5.2)
 
-Gemma 4's full-attention layers have 512-dimensional heads, which PyTorch's fused attention kernels do not take, so
-attention falls back to a path that holds every head's whole score matrix at once. For a prompt of n tokens that
-is heads x n^2 values per layer call: a 31B reading a 20k-token request needs tens of GB beyond the weights. That fits on a 141 GB
-H200 but not on the board's 96 GB RTX PRO 6000, where 1.5.0 stopped with "CUDA out of memory" on the longest
-Decision Index requests (and the kit stops a run at its first error).
+A 31B's weights take about 60 GB of the board's 96 GB RTX PRO 6000. In 1.5.0 a long prompt (tens of thousands of
+tokens) went through the model in one pass, and that pass's activations needed more than the 35 GB left: the longest
+Decision Index requests stopped with "CUDA out of memory", and the kit stops a run at its first error. A 141 GB H200
+has the room, which is why it did not show there.
 
-Since 1.5.1, when one attention call's scores would pass 1 GB, its queries go through in chunks, each against every
-key with its slice of the mask. Each query's softmax is computed exactly as before, so answers do not change; calls
-under the budget (every short request) take the original path. `CHON_ATTN_CHUNK_MB` sets the budget (0 turns it
-off). As a second guard, a Decision Index request that still runs out of GPU memory is read once more with a quarter
-of the attention, batch and pack budgets (`usage.oom_retry` = 1), and `PYTORCH_CUDA_ALLOC_CONF` defaults to
-`expandable_segments:True`. Everything else reads exactly as in 1.5.0.
+- **Prefill in chunks (1.5.2).** A prompt longer than 4,096 tokens fills the key/value cache 4,096 tokens at a time,
+  as the shared-prefix read already does for a request's questions; the question's own tokens are then read against
+  the cache. Memory then grows with the cache, not with the prompt's activations. `CHON_PREFILL_CHUNK` sets the
+  chunk (0 = one pass, as before).
+- **The widest heads in query chunks (1.5.1).** Gemma 4's full-attention heads are 512 wide, too wide for PyTorch's
+  fused attention kernels, so their attention holds every head's whole score matrix. When that would pass 1 GB the
+  queries go through in chunks against every key; narrower heads stay on the fused kernels (1.5.1 chunked them too,
+  which slowed long requests; 1.5.2 does not). `CHON_ATTN_CHUNK_MB` sets the budget (0 turns it off).
+- **Guards.** A Decision Index request that still runs out of GPU memory is read once more with a quarter of every
+  budget (`usage.oom_retry` = 1); if it still does not fit it is reported as unsupported, so the run goes on.
+  `PYTORCH_CUDA_ALLOC_CONF` defaults to `expandable_segments:True`.
+
+Answers are the same up to floating-point rounding (1e-7 in float32 on the tiny test model with tiny chunks, bf16
+rounding on a GPU); prompts under 4,096 tokens read exactly as in 1.5.0. Everything else is as in 1.5.0.
 
 ### Shared-prefix read
 

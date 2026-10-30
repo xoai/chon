@@ -31,6 +31,26 @@ class Unsupported(RuntimeError):
     pass
 
 
+DEFAULT_PREFILL_CHUNK = 4096
+_PREFILL_OVERRIDE: list = [None]
+
+
+def set_prefill_chunk(n: int | None) -> None:
+    """Override the chunk (None: back to $CHON_PREFILL_CHUNK / the default); the engine lowers it for a retry."""
+    _PREFILL_OVERRIDE[0] = None if n is None else int(n)
+
+
+def prefill_chunk() -> int:
+    """Tokens per pass when a long prefix fills the cache ($CHON_PREFILL_CHUNK, default 4096; 0 = one pass)."""
+    import os
+    if _PREFILL_OVERRIDE[0] is not None:
+        return _PREFILL_OVERRIDE[0]
+    try:
+        return int(os.environ.get("CHON_PREFILL_CHUNK", DEFAULT_PREFILL_CHUNK))
+    except ValueError:
+        return DEFAULT_PREFILL_CHUNK
+
+
 def common_prefix(seqs: Sequence[Sequence[int]]) -> int:
     """Length of the longest common token prefix. That of all the sequences is that of the lexicographically first
     and last (compared in C), so a 50,000-token state with 20 questions costs one Python pass, not twenty."""
@@ -127,11 +147,23 @@ class SharedPrefix:
         self.window = int(getattr(_text_config(model), "sliding_window", 0) or 0)
         ids = torch.tensor([self.tokens], dtype=torch.long, device=device)
         # inference mode: a model whose weights still want gradients would otherwise keep every activation of the
-        # prefix pass alive through the cached keys (the training repository measured 105-131 GB against 60-65 GB)
+        # prefix pass alive through the cached keys (the training repository measured 105-131 GB against 60-65 GB).
+        # A long prefix runs in chunks of prefill_chunk() tokens through the cache (1.5.2): one pass over 30k tokens
+        # held tens of GB of activations, more than a 96 GB card has beside a 31B's weights.
+        chunk = prefill_chunk()
         with torch.inference_mode():
             cache = _prefix_cache(model)
-            out = model(input_ids=ids, attention_mask=torch.ones_like(ids), past_key_values=cache, use_cache=True,
-                        logits_to_keep=1)
+            if chunk <= 0 or self.length <= chunk:
+                out = model(input_ids=ids, attention_mask=torch.ones_like(ids), past_key_values=cache,
+                            use_cache=True, logits_to_keep=1)
+            else:
+                for s in range(0, self.length, chunk):
+                    e = min(self.length, s + chunk)
+                    out = model(input_ids=ids[:, s:e], attention_mask=torch.ones((1, e), dtype=ids.dtype, device=device),
+                                past_key_values=cache, use_cache=True, logits_to_keep=1,
+                                cache_position=torch.arange(s, e, device=device))
+                    cache = out.past_key_values
+                    del out.logits
         cache = out.past_key_values
         if cache is None:
             raise Unsupported("the model returned no cache")
