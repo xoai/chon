@@ -4,13 +4,14 @@ Serving code for **Chon** typed-decision models:
 
 | Model | Base model | GPU memory (bf16) | Notes |
 |---|---|---|---|
+| [Chon-1.1-31B](https://huggingface.co/ninhnv/chon-1.1-31b) | `google/gemma-4-31B-it` | 80 GB or more (about 62 GB of weights) | newest; always one forward pass; Decision Index public 65.47 |
 | [Chon-1.0-12B](https://huggingface.co/ninhnv/chon-1.0-12b) | `google/gemma-4-12B-it` | about 40 GB (+ ~30 GB for vLLM) | most accurate; thinks briefly on unsure questions |
 | [Chon-1.0-12B-Fast](https://huggingface.co/ninhnv/chon-1.0-12b-fast) | `google/gemma-4-12B-it` | about 40 GB | the same model, always one forward pass |
 | [Chon-1.0-E4B](https://huggingface.co/ninhnv/chon-1.0-e4b) | `google/gemma-4-E4B-it` | 24 GB or more | smaller; Macs with 24 GB or more |
 | [Chon-1.0-E2B](https://huggingface.co/ninhnv/chon-1.0-e2b) | `google/gemma-4-E2B-it` | 16 GB or more | smallest and fastest; about 1 s per decision on an 18 GB MacBook Pro |
 
-Given a state (text, JSON or a conversation) and one question with a closed set of options, a Chon model
-returns a calibrated probability for every option:
+Given a state (text, JSON or a conversation) and one or more questions, each with a closed set of options, a
+Chon model returns a calibrated probability for every option:
 
 - **choice:** 2-256 options (more than 16 are read in groups of at most 16, then a final round between the
   group winners; every option still gets a probability)
@@ -27,7 +28,8 @@ pip install "chon[serve] @ git+https://github.com/xoai/chon"
 ```
 
 Tested with Python 3.12, torch 2.9.1 (CUDA 12.8), transformers 5.19-5.20 and peft 0.18.1, on one NVIDIA
-H100 80 GB. Access to the model's Gemma 4 base model on Hugging Face is required.
+H100 80 GB; Chon-1.1-31B also on one RTX PRO 6000 Blackwell (96 GB). Access to the model's Gemma 4 base model on
+Hugging Face is required.
 
 ## Serve
 
@@ -45,6 +47,17 @@ hf download google/gemma-4-12B-it
 hf download ninhnv/chon-1.0-12b --local-dir ./chon-1.0-12b
 HF_HUB_OFFLINE=1 python -m chon.serve --model ./chon-1.0-12b --port 8000
 ```
+
+Chon-1.1-31B needs one GPU with 80 GB or more and serving code 1.5.3 or newer (1.6.0 for the commit band):
+
+```bash
+python -m chon.serve --model ninhnv/chon-1.1-31b --port 8000
+python -m chon.serve --model ninhnv/chon-1.1-31b --port 8000 --noul-commit 0.199,0.801   # as served for JevBench
+```
+
+On the public JevBench files with the commit band (one H100 80 GB, one request at a time): hard 88.3%, original
+and easy 100%; median reply 0.11 s, slowest 1.87 s. The [model card](https://huggingface.co/ninhnv/chon-1.1-31b)
+has the full results.
 
 Options:
 - `--host`, `--port`: where to listen.
@@ -392,6 +405,10 @@ model's prompt layout and style, uncapped letters, temperatures per category, se
 shared-prefix settings (above) apply, and the run's provenance states them. The yes/no commit band is off unless
 `--option noul_commit=LO,HI` (or `true`, the model's own band) turns it on.
 `python -m chon.dindex shard` / `merge` split the suite so several runner processes can share GPUs.
+
+Chon-1.1-31B scores **65.47** on the public 0.3 suite with this engine (our run with 1.5.3: the full suite in 4
+parts on 4 RTX PRO 6000 cards; median 154 ms, mean 725 ms, 80th percentile 585 ms per request). The model card
+has the commands to reproduce it.
 
 ## Tests
 
