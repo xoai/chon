@@ -10,7 +10,7 @@ install() wraps transformers' "sdpa" attention: when one call's score matrices w
 go through in chunks, each against every key with its own slice of the mask. Every query row's softmax is computed
 exactly as before (rows are independent), so the answers do not change; small calls (everything under the budget,
 every parity case) take the original path untouched. $CHON_ATTN_CHUNK_MB sets the budget (default 1024 MB; 0 turns
-chunking off)."""
+chunking off; unset since 1.5.3: a quarter of the free GPU memory, 1-8 GB)."""
 from __future__ import annotations
 
 import os
@@ -22,14 +22,30 @@ DEFAULT_BUDGET_MB = 1024
 FUSED_MAX_HEAD_DIM = 256
 
 
-def budget_bytes() -> int:
+MAX_AUTO_BUDGET = 8 * 2 ** 30
+
+
+def budget_bytes(device=None) -> int:
+    """The score budget of one attention call: set_budget's, else $CHON_ATTN_CHUNK_MB, else (1.5.3) a quarter of the
+    GPU's free memory between 1 GB and 8 GB (the reference path holds about three score-sized tensors at once), else
+    1 GB. 1.5.2's fixed 1 GB cut a 70,000-token prompt's attention into hundreds of small calls per layer: the
+    Decision Index requests with 20-30 questions about one short state took 3-5 minutes each on an RTX PRO 6000."""
     if _STATE["budget"] is not None:
         return _STATE["budget"]
-    try:
-        mb = float(os.environ.get("CHON_ATTN_CHUNK_MB", DEFAULT_BUDGET_MB))
-    except ValueError:
-        mb = DEFAULT_BUDGET_MB
-    return int(mb * 2 ** 20)
+    env = os.environ.get("CHON_ATTN_CHUNK_MB")
+    if env not in (None, ""):
+        try:
+            return int(float(env) * 2 ** 20)
+        except ValueError:
+            pass
+    if device is not None and getattr(device, "type", "") == "cuda":
+        try:
+            import torch
+            free, _ = torch.cuda.mem_get_info(device)
+            return int(max(DEFAULT_BUDGET_MB * 2 ** 20, min(MAX_AUTO_BUDGET, free // 4)))
+        except Exception:   # noqa: BLE001
+            pass
+    return DEFAULT_BUDGET_MB * 2 ** 20
 
 
 def set_budget(n_bytes: int | None) -> None:
@@ -48,9 +64,9 @@ def _wrap(orig):
     import torch
 
     def chunked_sdpa(module, query, key, value, attention_mask, dropout=0.0, scaling=None, is_causal=None, **kwargs):
-        budget = budget_bytes()
         b, h, q_len, d = query.shape
         kv_len = key.shape[2]
+        budget = budget_bytes(query.device) if d > FUSED_MAX_HEAD_DIM else 0
         if budget <= 0 or d <= FUSED_MAX_HEAD_DIM or kwargs.get("cache") is not None or kwargs.get("position_bias") is not None \
                 or b * h * q_len * kv_len * 4 <= budget:
             return orig(module, query, key, value, attention_mask, dropout, scaling, is_causal, **kwargs)

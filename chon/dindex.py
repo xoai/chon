@@ -191,16 +191,16 @@ class ChonEngine(Engine):
         from chon import attention, prefix
 
         _free_gpu()
-        old = (attention.budget_bytes(), self.dm.max_batch_tokens, self.dm.cfg.get("prefix_pack_tokens"))
+        old = (attention._STATE["budget"], self.dm.max_batch_tokens, self.dm.cfg.get("prefix_pack_tokens"))
         old_chunk = prefix.prefill_chunk()
         prefix.set_prefill_chunk(max(512, (old_chunk or prefix.DEFAULT_PREFILL_CHUNK) // 4))
-        attention.set_budget(max(64 * 2 ** 20, old[0] // 4))
+        attention.set_budget(attention.DEFAULT_BUDGET_MB * 2 ** 20 // 4)
         self.dm.max_batch_tokens = max(1024, old[1] // 4)
         self.dm.cfg["prefix_pack_tokens"] = max(512, int(old[2] or 8192) // 4)
         try:
             answers, usage = self.dm.predict(state, questions)
         finally:
-            attention.set_budget(None if old[0] == attention.DEFAULT_BUDGET_MB * 2 ** 20 else old[0])
+            attention.set_budget(old[0])
             prefix.set_prefill_chunk(None)
             self.dm.max_batch_tokens = old[1]
             if old[2] is None:

@@ -177,3 +177,18 @@ def test_chunked_prefill_reads_the_same(tiny_dm, questions):
     for n in questions:
         for o, p in want[n]["probabilities"].items():
             assert abs(got[n]["probabilities"][o] - p) < 1e-5
+
+
+def test_the_budget_follows_free_gpu_memory(monkeypatch):
+    """1.5.3: a quarter of the free memory, 1-8 GB (1.5.2's fixed 1 GB made 70k-token prompts take minutes)."""
+    import types
+    monkeypatch.delenv("CHON_ATTN_CHUNK_MB", raising=False)
+    attention.set_budget(None)
+    cuda = types.SimpleNamespace(type="cuda")
+    G = 2 ** 30
+    for free, want in ((40 * G, 8 * G), (10 * G, 10 * G // 4), (2 * G, 1 * G)):
+        monkeypatch.setattr(torch.cuda, "mem_get_info", lambda device=None, f=free: (f, 96 * G))
+        assert attention.budget_bytes(cuda) == want
+    assert attention.budget_bytes(None) == attention.DEFAULT_BUDGET_MB * 2 ** 20      # CPU: the fixed default
+    monkeypatch.setenv("CHON_ATTN_CHUNK_MB", "512")
+    assert attention.budget_bytes(cuda) == 512 * 2 ** 20                              # the setting wins

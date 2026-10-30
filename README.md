@@ -213,7 +213,7 @@ kinds of questions, and the pair read combines them.
 **Version 1.4.0 and older ignore `"pair"`** (they read the adapter alone, merged), so serve a model that sets it with
 1.5.0 or newer. A config without `"pair"` or `"reverse"` reads exactly as in 1.4.0.
 
-### Long prompts on a 96 GB card (1.5.1, 1.5.2)
+### Long prompts on a 96 GB card (1.5.1 to 1.5.3)
 
 A 31B's weights take about 60 GB of the board's 96 GB RTX PRO 6000. In 1.5.0 a long prompt (tens of thousands of
 tokens) went through the model in one pass, and that pass's activations needed more than the 35 GB left: the longest
@@ -227,7 +227,10 @@ has the room, which is why it did not show there.
 - **The widest heads in query chunks (1.5.1).** Gemma 4's full-attention heads are 512 wide, too wide for PyTorch's
   fused attention kernels, so their attention holds every head's whole score matrix. When that would pass 1 GB the
   queries go through in chunks against every key; narrower heads stay on the fused kernels (1.5.1 chunked them too,
-  which slowed long requests; 1.5.2 does not). `CHON_ATTN_CHUNK_MB` sets the budget (0 turns it off).
+  which slowed long requests; 1.5.2 does not). Since 1.5.3 the budget is a quarter of the GPU's free memory, between 1
+  and 8 GB (1.5.2's fixed 1 GB cut the attention of a 70,000-token prompt, 20-30 questions about one short state,
+  into hundreds of small calls: 3-5 minutes per request on the card). `CHON_ATTN_CHUNK_MB` fixes the budget (0 turns
+  it off).
 - **Guards.** A Decision Index request that still runs out of GPU memory is read once more with a quarter of every
   budget (`usage.oom_retry` = 1); if it still does not fit it is reported as unsupported, so the run goes on.
   `PYTORCH_CUDA_ALLOC_CONF` defaults to `expandable_segments:True`.
