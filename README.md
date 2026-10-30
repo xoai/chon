@@ -213,6 +213,21 @@ kinds of questions, and the pair read combines them.
 **Version 1.4.0 and older ignore `"pair"`** (they read the adapter alone, merged), so serve a model that sets it with
 1.5.0 or newer. A config without `"pair"` or `"reverse"` reads exactly as in 1.4.0.
 
+### Long prompts on a 96 GB card (1.5.1)
+
+Gemma 4's full-attention layers have 512-dimensional heads, which PyTorch's fused attention kernels do not take, so
+attention falls back to a path that holds every head's whole score matrix at once. For a prompt of n tokens that
+is heads x n^2 values per layer call: a 31B reading a 20k-token request needs tens of GB beyond the weights. That fits on a 141 GB
+H200 but not on the board's 96 GB RTX PRO 6000, where 1.5.0 stopped with "CUDA out of memory" on the longest
+Decision Index requests (and the kit stops a run at its first error).
+
+Since 1.5.1 (and in 1.6.0), when one attention call's scores would pass 1 GB, its queries go through in chunks, each against every
+key with its slice of the mask. Each query's softmax is computed exactly as before, so answers do not change; calls
+under the budget (every short request) take the original path. `CHON_ATTN_CHUNK_MB` sets the budget (0 turns it
+off). As a second guard, a Decision Index request that still runs out of GPU memory is read once more with a quarter
+of the attention, batch and pack budgets (`usage.oom_retry` = 1), and `PYTORCH_CUDA_ALLOC_CONF` defaults to
+`expandable_segments:True`. Everything else reads exactly as before.
+
 ### Temperatures per category
 
 Since 1.6.0 a model's `chon_config.json` can calibrate questions by category, not only by type. A question takes the

@@ -424,6 +424,9 @@ class DecisionModel:
             merge = merge and not parse_pair(cfg.get("pair"))   # the pair's base read switches the adapter off
         tok_dir = adapter if adapter and os.path.exists(os.path.join(adapter, "tokenizer_config.json")) else path
         tok = load_tokenizer(tok_dir)
+        if attn_implementation in (None, "sdpa"):
+            from .attention import install   # long prompts' attention in query chunks (1.5.1): bounded memory
+            install()
         model = load_causal_lm(path, dtype=dtype, attn_implementation=attn_implementation,
                                device_map=None if device == "cpu" else device)
         if adapter:
