@@ -30,11 +30,15 @@ answers (bf16 rounding). Memory bound: see README, "Shared-prefix read".
 from __future__ import annotations
 
 import argparse
+import gc
 import gzip
 import hashlib
 import json
 import os
 from pathlib import Path
+
+# fewer "reserved but unused" blocks between requests of very different lengths (1.5.1); set before torch starts CUDA
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 try:
     from decision_index.engines.base import Engine, Unsupported
@@ -69,6 +73,7 @@ class ChonEngine(Engine):
         if not noul_commit:
             self.dm.noul_commit = None
         self._cuda = str(device).startswith("cuda") and torch.cuda.is_available()
+        self.oom_retries = 0
         rr = self.dm.reread
         layout_text = {
             "state_first": "the state, then the question and its options",
@@ -127,16 +132,45 @@ class ChonEngine(Engine):
                       (prefix_text if self.dm.prefix_cache else
                        "Every read runs its whole prompt (no shared-prefix read). ") +
                       "A state over max_state_tokens is refused as unsupported (maximum context length), never "
-                      "truncated."}
+                      "truncated. Long prompts' attention runs in query chunks (bounded GPU memory, the same "
+                      "answers), and a request that runs out of GPU memory is read once more in smaller pieces."}
 
     def __call__(self, state, questions):
         from chon.schema import ItemError
 
         try:
-            answers, usage = self.dm.predict(state, questions)
+            try:
+                answers, usage = self.dm.predict(state, questions)
+            except Exception as e:   # noqa: BLE001 -- out of GPU memory: once more with smaller pieces (1.5.1)
+                if not _is_oom(e):
+                    raise
+                answers, usage = self._retry_smaller(state, questions)
         except ItemError as e:  # capacity (too long) or a request this engine cannot take: unsupported
             raise Unsupported(str(e)) from None
         return {"model": self.dm.name, "answers": answers, "usage": usage}, None
+
+    def _retry_smaller(self, state, questions):
+        """A request that ran out of GPU memory, read again with a quarter of the attention budget, the batch budget
+        and the shared-prefix pack: the same answers in smaller pieces. A second failure is the request's error."""
+        from chon import attention
+
+        _free_gpu()
+        old = (attention.budget_bytes(), self.dm.max_batch_tokens, self.dm.cfg.get("prefix_pack_tokens"))
+        attention.set_budget(max(64 * 2 ** 20, old[0] // 4))
+        self.dm.max_batch_tokens = max(1024, old[1] // 4)
+        self.dm.cfg["prefix_pack_tokens"] = max(512, int(old[2] or 8192) // 4)
+        try:
+            answers, usage = self.dm.predict(state, questions)
+        finally:
+            attention.set_budget(None if old[0] == attention.DEFAULT_BUDGET_MB * 2 ** 20 else old[0])
+            self.dm.max_batch_tokens = old[1]
+            if old[2] is None:
+                self.dm.cfg.pop("prefix_pack_tokens", None)
+            else:
+                self.dm.cfg["prefix_pack_tokens"] = old[2]
+            _free_gpu()
+        self.oom_retries += 1
+        return answers, {**usage, "oom_retry": 1}
 
     def synchronize(self):
         if self._cuda:
@@ -150,6 +184,21 @@ class ChonEngine(Engine):
 
         return {"torch": torch.__version__, "transformers": transformers.__version__,
                 "device": torch.cuda.get_device_name(0) if self._cuda else "cpu"}
+
+
+def _is_oom(e: BaseException) -> bool:
+    import torch
+
+    oom = getattr(torch, "OutOfMemoryError", None) or getattr(torch.cuda, "OutOfMemoryError", None)
+    return (oom is not None and isinstance(e, oom)) or "out of memory" in str(e).lower()
+
+
+def _free_gpu() -> None:
+    import torch
+
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
 
 def _suite(directory, edition=None):
