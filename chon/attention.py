@@ -17,6 +17,9 @@ import os
 
 _STATE = {"installed": False, "orig": None, "budget": None, "chunked_calls": 0}
 DEFAULT_BUDGET_MB = 1024
+# heads up to this width go to PyTorch's fused kernels, which never hold the score matrix: left alone (1.5.2; 1.5.1
+# chunked them too, which kept them off the fused kernels and slowed every long request)
+FUSED_MAX_HEAD_DIM = 256
 
 
 def budget_bytes() -> int:
@@ -46,9 +49,9 @@ def _wrap(orig):
 
     def chunked_sdpa(module, query, key, value, attention_mask, dropout=0.0, scaling=None, is_causal=None, **kwargs):
         budget = budget_bytes()
-        b, h, q_len, _ = query.shape
+        b, h, q_len, d = query.shape
         kv_len = key.shape[2]
-        if budget <= 0 or kwargs.get("cache") is not None or kwargs.get("position_bias") is not None \
+        if budget <= 0 or d <= FUSED_MAX_HEAD_DIM or kwargs.get("cache") is not None or kwargs.get("position_bias") is not None \
                 or b * h * q_len * kv_len * 4 <= budget:
             return orig(module, query, key, value, attention_mask, dropout, scaling, is_causal, **kwargs)
         rows = chunk_rows(b, h, kv_len, budget)

@@ -83,6 +83,7 @@ class ChonEngine(Engine):
         commit = self.dm.noul_commit
         self._cuda = str(device).startswith("cuda") and torch.cuda.is_available()
         self.oom_retries = 0
+        self.oom_unsupported = 0
         rr = self.dm.reread
         layout_text = {
             "state_first": "the state, then the question and its options",
@@ -156,8 +157,9 @@ class ChonEngine(Engine):
                       (prefix_text if self.dm.prefix_cache else
                        "Every read runs its whole prompt (no shared-prefix read). ") +
                       "A state over max_state_tokens is refused as unsupported (maximum context length), never "
-                      "truncated. Long prompts' attention runs in query chunks (bounded GPU memory, the same "
-                      "answers), and a request that runs out of GPU memory is read once more in smaller pieces."}
+                      "truncated. A long prompt fills the cache in chunks of 4,096 tokens and its widest attention heads run "
+                      "in query chunks (bounded GPU memory, the same answers); a request that runs out of GPU memory "
+                      "is read once more in smaller pieces, and reported as unsupported if it still does not fit."}
 
     def __call__(self, state, questions):
         from chon.schema import ItemError
@@ -168,18 +170,30 @@ class ChonEngine(Engine):
             except Exception as e:   # noqa: BLE001 -- out of GPU memory: once more with smaller pieces (1.5.1)
                 if not _is_oom(e):
                     raise
-                answers, usage = self._retry_smaller(state, questions)
+                try:
+                    answers, usage = self._retry_smaller(state, questions)
+                except Exception as e2:   # noqa: BLE001
+                    if not _is_oom(e2):
+                        raise
+                    # still too big for this card: unsupported (the run goes on), never a crashed run (1.5.2)
+                    _free_gpu()
+                    self.oom_unsupported += 1
+                    raise ItemError(f"out of GPU memory on this card even in smaller pieces: {str(e2)[:120]}") \
+                        from None
         except ItemError as e:  # capacity (too long) or a request this engine cannot take: unsupported
             raise Unsupported(str(e)) from None
         return {"model": self.dm.name, "answers": answers, "usage": usage}, None
 
     def _retry_smaller(self, state, questions):
-        """A request that ran out of GPU memory, read again with a quarter of the attention budget, the batch budget
-        and the shared-prefix pack: the same answers in smaller pieces. A second failure is the request's error."""
-        from chon import attention
+        """A request that ran out of GPU memory, read again with a quarter of the attention budget, the batch budget,
+        the shared-prefix pack and the prefill chunk: the same answers in smaller pieces. A second failure is
+        reported as unsupported (__call__)."""
+        from chon import attention, prefix
 
         _free_gpu()
         old = (attention.budget_bytes(), self.dm.max_batch_tokens, self.dm.cfg.get("prefix_pack_tokens"))
+        old_chunk = prefix.prefill_chunk()
+        prefix.set_prefill_chunk(max(512, (old_chunk or prefix.DEFAULT_PREFILL_CHUNK) // 4))
         attention.set_budget(max(64 * 2 ** 20, old[0] // 4))
         self.dm.max_batch_tokens = max(1024, old[1] // 4)
         self.dm.cfg["prefix_pack_tokens"] = max(512, int(old[2] or 8192) // 4)
@@ -187,6 +201,7 @@ class ChonEngine(Engine):
             answers, usage = self.dm.predict(state, questions)
         finally:
             attention.set_budget(None if old[0] == attention.DEFAULT_BUDGET_MB * 2 ** 20 else old[0])
+            prefix.set_prefill_chunk(None)
             self.dm.max_batch_tokens = old[1]
             if old[2] is None:
                 self.dm.cfg.pop("prefix_pack_tokens", None)

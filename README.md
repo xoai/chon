@@ -213,63 +213,27 @@ kinds of questions, and the pair read combines them.
 **Version 1.4.0 and older ignore `"pair"`** (they read the adapter alone, merged), so serve a model that sets it with
 1.5.0 or newer. A config without `"pair"` or `"reverse"` reads exactly as in 1.4.0.
 
-### Long prompts on a 96 GB card (1.5.1)
+### Long prompts on a 96 GB card (1.5.1, 1.5.2)
 
-Gemma 4's full-attention layers have 512-dimensional heads, which PyTorch's fused attention kernels do not take, so
-attention falls back to a path that holds every head's whole score matrix at once. For a prompt of n tokens that
-is heads x n^2 values per layer call: a 31B reading a 20k-token request needs tens of GB beyond the weights. That fits on a 141 GB
-H200 but not on the board's 96 GB RTX PRO 6000, where 1.5.0 stopped with "CUDA out of memory" on the longest
-Decision Index requests (and the kit stops a run at its first error).
+A 31B's weights take about 60 GB of the board's 96 GB RTX PRO 6000. In 1.5.0 a long prompt (tens of thousands of
+tokens) went through the model in one pass, and that pass's activations needed more than the 35 GB left: the longest
+Decision Index requests stopped with "CUDA out of memory", and the kit stops a run at its first error. A 141 GB H200
+has the room, which is why it did not show there.
 
-Since 1.5.1 (and in 1.6.0), when one attention call's scores would pass 1 GB, its queries go through in chunks, each against every
-key with its slice of the mask. Each query's softmax is computed exactly as before, so answers do not change; calls
-under the budget (every short request) take the original path. `CHON_ATTN_CHUNK_MB` sets the budget (0 turns it
-off). As a second guard, a Decision Index request that still runs out of GPU memory is read once more with a quarter
-of the attention, batch and pack budgets (`usage.oom_retry` = 1), and `PYTORCH_CUDA_ALLOC_CONF` defaults to
-`expandable_segments:True`. Everything else reads exactly as before.
+- **Prefill in chunks (1.5.2).** A prompt longer than 4,096 tokens fills the key/value cache 4,096 tokens at a time,
+  as the shared-prefix read already does for a request's questions; the question's own tokens are then read against
+  the cache. Memory then grows with the cache, not with the prompt's activations. `CHON_PREFILL_CHUNK` sets the
+  chunk (0 = one pass, as before).
+- **The widest heads in query chunks (1.5.1).** Gemma 4's full-attention heads are 512 wide, too wide for PyTorch's
+  fused attention kernels, so their attention holds every head's whole score matrix. When that would pass 1 GB the
+  queries go through in chunks against every key; narrower heads stay on the fused kernels (1.5.1 chunked them too,
+  which slowed long requests; 1.5.2 does not). `CHON_ATTN_CHUNK_MB` sets the budget (0 turns it off).
+- **Guards.** A Decision Index request that still runs out of GPU memory is read once more with a quarter of every
+  budget (`usage.oom_retry` = 1); if it still does not fit it is reported as unsupported, so the run goes on.
+  `PYTORCH_CUDA_ALLOC_CONF` defaults to `expandable_segments:True`.
 
-### Temperatures per category
-
-Since 1.6.0 a model's `chon_config.json` can calibrate questions by category, not only by type. A question takes the
-temperature of its most specific category in `"temperature_categories"`: first `"<type>:<options>:<state>"`, then
-`"<type>:<options>"`, else its type's temperature in `"temperatures"`.
-
-```json
-"temperature_categories": {"choice:3-4:text": 1.2, "choice:3-4": 1.1, "noul:2:json": 0.9, "choice:26+": 1.4}
-```
-
-- `<type>`: `choice`, `noul` or `score`.
-- `<options>`: the number of options read, binned `2`, `3-4`, `5-9`, `10-25` or `26+`.
-- `<state>`: `empty` (no state, or only whitespace), `text` (any other string) or `json` (anything not a string: a
-  JSON object, a conversation).
-- The temperature is used wherever the question's letters are read: the first read, a second read (each question
-  with its own temperature) and both rounds of a choice over 16 options. Every such choice of a request takes the
-  category of the request's largest one (by its number of options), as the training code reads them.
-- A pair read's base read takes the pair's own `"temperature_categories"` (inside `"pair"`), and none when the pair
-  sets none; the adapter read takes the config's.
-- `/health` (how many categories), the server's start line and the Decision Index provenance (every category)
-  report them.
-
-Temperatures only reshape each read's distribution; the categories are fitted on the model's development questions.
-**Version 1.5.0 and older ignore `"temperature_categories"`** (they read every question at its type's temperature), so
-serve a model that sets them with 1.6.0 or newer.
-
-### Rotated second read
-
-Since 1.6.0 the second read can also be `"layout": "rotate"`: the unsure question is read again in the first read's
-prompt (its layout, question list and state, written once) with its options rotated by half, the first half moved to
-the end: options `A B C D E` are shown as `C D E A B`, and `A B C D` as `C D A B`. The second read's probabilities are
-mapped back to the options by label and combined as set (`"avg"` or `"replace"`). Unlike the reverse order, every
-option moves by the same number of places; for two options the two are the same.
-
-```json
-"reread": {"below": 1.01, "layout": "rotate", "max_tokens": 3000, "combine": "avg"}
-```
-
-or `CHON_REREAD="1.01,rotate,3000"` (`--reread 1.01,rotate,3000`). Everything else about the second read applies as for
-`"reverse"` (the threshold, the prompt length limit, choices over 16 options read once, skipped near the deadline, the
-shared-prefix read, the decider style). **Version 1.5.0 and older refuse `"rotate"`** at load as an unknown layout. A
-config without `"temperature_categories"` or `"rotate"` reads exactly as in 1.5.0.
+Answers are the same up to floating-point rounding (1e-7 in float32 on the tiny test model with tiny chunks, bf16
+rounding on a GPU); prompts under 4,096 tokens read exactly as in 1.5.0. Everything else is as in 1.5.0.
 
 ### Shared-prefix read
 

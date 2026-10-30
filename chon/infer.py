@@ -71,7 +71,8 @@ from .modeling import (letter_logits, left_pad, load_causal_lm, load_tokenizer, 
                        uncap_logits)
 import contextlib
 
-from .prefix import SharedPrefix, Unsupported, check_supported, common_prefix, pack_budget, packed_batches
+from .prefix import (SharedPrefix, Unsupported, check_supported, common_prefix, pack_budget, packed_batches,
+                     prefill_chunk)
 from .prompt import INLINE_PREFIX, INLINE_SUFFIX, PROMPT_STYLES, REREAD_LAYOUTS, PromptBuilder, suffix_letter_ids
 from .schema import MAX_OPTIONS, CapacityError, ItemError, options_for, validate_item
 
@@ -504,8 +505,18 @@ class DecisionModel:
                    letter_ids: torch.Tensor | None = None) -> list[list[float]]:
         """Letter logits for each sequence (first n_options letters), batched by padded token budget."""
         letter_ids = self.letter_ids if letter_ids is None else letter_ids
-        order = sorted(range(len(seqs)), key=lambda i: -len(seqs[i]))
         out: list[list[float] | None] = [None] * len(seqs)
+        chunk = prefill_chunk()
+        if chunk > 0 and not self._prefix_off:   # a long prompt: its prefix fills the cache in chunks (1.5.2)
+            for j in [j for j in range(len(seqs)) if len(seqs[j]) > chunk]:
+                try:
+                    sp = SharedPrefix(self.model, seqs[j][:-1], self.device)
+                    out[j] = sp.letter_logits([seqs[j][-1:]], letter_ids)[0].cpu().tolist()[: n_options[j]]
+                except _PREFIX_FAILURES:
+                    break   # a model the shared-prefix read cannot take: every long prompt in one pass, as before
+                finally:
+                    sp = None
+        order = sorted([i for i in range(len(seqs)) if out[i] is None], key=lambda i: -len(seqs[i]))
         pad = self.tok.pad_token_id
         i = 0
         while i < len(order):
