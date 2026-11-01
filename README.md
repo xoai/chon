@@ -77,6 +77,8 @@ Options:
   [Prompt layout and second read](#prompt-layout-and-second-read).
 - `--prefix-cache on|off`: the shared-prefix read (default: the model's `chon_config.json` `"prefix_cache"`, else
   on). See [Shared-prefix read](#shared-prefix-read).
+- `--reader hf|vllm`, `--vllm-quant fp8` (since 1.7.0): read the letters through a vLLM server of the merged model.
+  See [vLLM as the reader](#vllm-as-the-reader-170).
 - `--noul-commit LO,HI|off` (since 1.6.0): the yes/no commit band, overriding the model's `chon_config.json`
   `"noul_commit"` (unset keeps it). See [Yes/no commit band](#yesno-commit-band).
 
@@ -321,6 +323,42 @@ a slow disk) before `/health` answers.
 Measured on one H100 80 GB, one request at a time: Chon-1.0-12B answers in 0.11 s at the median, 4.8 s at the
 95th percentile (reasoning written by vLLM, FP8) and 0.6 s on average; with the static cache the 95th
 percentile is about 10 s, and with plain transformers generation about 24 s.
+
+### vLLM as the reader (1.7.0)
+
+With `--reader vllm` the option letters are read by a [vLLM](https://github.com/vllm-project/vllm) server of the
+model instead of this process: the adapter is merged into its base once (under `$CHON_MERGED_DIR`, default
+`/workspace/merged` or `~/.cache/chon/merged`; about 62 GB for the 31B), the server starts on the merged checkpoint,
+and the prompts, temperatures, second read, commit band and every other rule stay in Chon. `--vllm-quant fp8` uses
+vLLM's online FP8 weights. vLLM shares a request's common prefix through its own cache. Install vLLM in its own
+environment as above, then:
+
+```bash
+CHON_VLLM_MAX_LEN=90000 CHON_VLLM_MEM=0.94 \
+  python -m chon.serve --model ninhnv/chon-1.1-31b --reader vllm --vllm-quant fp8 --port 8000
+CHON_VLLM_MAX_LEN=90000 CHON_VLLM_MEM=0.94 \
+  python -m decision_index run --engine chon.dindex:ChonEngine --option model=ninhnv/chon-1.1-31b \
+    --option reader=vllm --option vllm_quant=fp8 ...
+```
+
+`CHON_VLLM_MAX_LEN` (default 34,816) must cover the longest prompt: header-layout requests with many questions reach
+about 73,000 tokens on the Decision Index suite. `CHON_VLLM_MEM` is the share of the GPU vLLM takes (default 0.85; in
+bf16 the 31B needs 0.94 on a 96 GB card to hold one 90,000-token request). A model read with its soft cap off
+(`"uncap_logits": true`, Chon-1.1-31B) is served from a copy of the merged config without the cap, so vLLM's letters
+are the same ones. Not with "think when unsure" (the reasoning needs this process's model) or a pair read. `/health`
+reports the reader.
+
+Measured on one RTX PRO 6000 (96 GB), Chon-1.1-31B with its second read, half of a fixed 20,000-request sample of the
+public Decision Index suite one request at a time, paired with our own reader on the same rows and machine:
+
+| reader | Decision Index vs our reader | median / mean / 80th percentile ms per request |
+|---|---:|---|
+| this process (bf16) | — | 214 / 940 / 924 |
+| vLLM, bf16 | +0.1 (-0.2 to +0.3) | 154 / 870 / 974 |
+| vLLM, FP8 | -0.1 (-0.5 to +0.3) | 117 / 624 / 656 |
+
+JevBench hard read 88.3 with our reader and 89.2 with vLLM FP8; held-out and the development sets were unchanged.
+The gain is FP8's (the card's FP8 tensor cores); vLLM in bf16 is close to this process.
 
 ### Docker
 

@@ -60,6 +60,9 @@ def create_app(model, api_key: str | None = None, deadline_s: float = 0.0):
                 "pair": getattr(model, "pair", None), "reread": getattr(model, "reread", None),
                 "reread_stats": dict(getattr(model, "reread_stats", {}) or {}),
                 "prefix_cache": getattr(model, "prefix_cache", None),
+                "reader": "vllm" if getattr(model, "backend", None) is not None else "hf",
+                "vllm_quant": (os.environ.get("CHON_VLLM_QUANT") or None) if getattr(model, "backend", None) is not None
+                else None,
                 "prefix_stats": dict(getattr(model, "prefix_stats", {}) or {})}
 
     @app.get("/v1/models")
@@ -135,6 +138,10 @@ def main(argv=None) -> None:
     ap.add_argument("--prefix-cache", default=None, choices=["on", "off"],
                     help="the shared-prefix read: a request's shared part (state, question list) read once for all its "
                          "questions, same answers (default: the model's chon_config.json \"prefix_cache\", else on)")
+    ap.add_argument("--reader", default=None, choices=["hf", "vllm"],
+                    help="who reads the option letters: hf (this process; default) or vllm (a vLLM server of the merged "
+                         "model, started here: README, \"vLLM as the reader\"; since 1.7.0)")
+    ap.add_argument("--vllm-quant", default=None, choices=["fp8"], help="with --reader vllm: vLLM's online FP8 weights")
     ap.add_argument("--host", default="0.0.0.0")
     ap.add_argument("--port", type=int, default=8000)
     args = ap.parse_args(argv)
@@ -147,7 +154,8 @@ def main(argv=None) -> None:
         os.environ["CHON_REREAD"] = args.reread   # read by DecisionModel (chon.infer.parse_reread)
     think = False if args.no_think else (json.load(open(args.think)) if args.think else None)
     model = DecisionModel.load(args.model, adapter=args.adapter, device=args.device, dtype=args.dtype,
-                               quantize=args.quantize, compile=args.compile, think=think)
+                               quantize=args.quantize, compile=args.compile, think=think, reader=args.reader,
+                               vllm_quant=args.vllm_quant)
     if args.prefix_cache is not None:
         model.cfg["prefix_cache"] = args.prefix_cache == "on"
     if args.noul_commit is not None:
@@ -156,7 +164,8 @@ def main(argv=None) -> None:
         k, _, v = kv.partition("=")
         if model.think is not None:
             model.think[k] = json.loads(v) if v[:1] in "[{0123456789" or v in ("true", "false", "null") else v
-    print(f"[serve] {model.name} on {model.device}, prompt layout {model.layout}"
+    print(f"[serve] {model.name} on {'a vLLM reader' if model.backend is not None else model.device}, "
+          f"prompt layout {model.layout}"
           + (f", prompt style {model.style}" if model.style != "chon" else "")
           + (", letters read without the final soft cap" if model.uncapped else "")
           + (f", {len(model.temperature_categories)} temperatures per category" if model.temperature_categories

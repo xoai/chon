@@ -72,6 +72,24 @@ def _stop_all() -> None:
                 pass
 
 
+def _stop_on_signals() -> None:
+    """A process killed by SIGTERM / SIGHUP (a timeout, the job runner) stops its vLLM servers too: atexit does not run
+    then, and a server left behind would hold the GPU for the next reader."""
+    import signal
+
+    def handler(signum, frame):
+        _stop_all()
+        signal.signal(signum, signal.SIG_DFL)
+        os.kill(os.getpid(), signum)
+
+    for sig in (signal.SIGTERM, signal.SIGHUP):
+        try:
+            if signal.getsignal(sig) in (signal.SIG_DFL, None):
+                signal.signal(sig, handler)
+        except (ValueError, OSError):   # not the main thread
+            pass
+
+
 def gpu_budget(cfg: dict) -> float | None:
     """The fraction of the GPU vLLM may take, from what is free now (our model is loaded already), or None when
     too little is left (the fallback engine then writes the reasoning)."""
@@ -134,7 +152,7 @@ def ensure(base_model: str, cfg: dict | None = None) -> str | None:
     url = f"http://127.0.0.1:{port}"
     base_cmd = [binary, "serve", model_path, "--host", "127.0.0.1", "--port", str(port), "--dtype", "bfloat16",
                 "--max-model-len", str(int(cfg.get("max_model_len", 9216))), "--gpu-memory-utilization", str(util),
-                "--served-model-name", "chon-reasoner", "--enable-prefix-caching"]
+                "--served-model-name", str(cfg.get("served_name", "chon-reasoner")), "--enable-prefix-caching"]
     if cfg.get("quantization"):
         base_cmd += ["--quantization", str(cfg["quantization"])]
     base_cmd += [str(x) for x in cfg.get("extra_args", [])]
@@ -165,6 +183,7 @@ def ensure(base_model: str, cfg: dict | None = None) -> str | None:
         proc = subprocess.Popen(cmd, stdout=logf, stderr=subprocess.STDOUT, env=env, start_new_session=True)
         if not _procs:
             atexit.register(_stop_all)
+            _stop_on_signals()
         _procs.append(proc)
         while time.time() < deadline:
             if proc.poll() is not None:

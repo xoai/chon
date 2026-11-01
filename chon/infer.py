@@ -298,9 +298,11 @@ def resolve_device(device: str | None) -> str:
 
 class DecisionModel:
     def __init__(self, model, tokenizer, cfg: dict | None = None, device: str | torch.device = "cpu",
-                 max_batch_tokens: int = 32768, name: str = "chon"):
+                 max_batch_tokens: int = 32768, name: str = "chon", backend=None):
         cfg = dict(cfg or {})
         self.model = model
+        # another engine reads the letters (chon.vllm_reader: --reader vllm, 1.7.0); None = this process's model
+        self.backend = backend
         self.tok = tokenizer
         self.cfg = cfg
         self.name = cfg.get("name", name)
@@ -360,6 +362,8 @@ class DecisionModel:
         if self.pair is not None and model is not None and not hasattr(model, "disable_adapter"):
             raise ValueError("a pair read needs the adapter unmerged (a PEFT model): this model has none")
         self.think = dict(cfg["think"]) if cfg.get("think") else None
+        if self.pair is not None and backend is not None:
+            raise ValueError("a pair read needs this process's model (with and without its adapter): not with --reader vllm")
         if self.pair is not None and self.think:
             raise ValueError("a pair read is not supported with thinking")
         self.think_tokens: list[int | None] = []
@@ -374,7 +378,7 @@ class DecisionModel:
         # keys/values live in self._shared for that request only. _prefix_off: the model cannot take it (plain from
         # then on, said once)
         self._shared: SharedPrefix | None = None
-        self._prefix_off = False
+        self._prefix_off = backend is not None   # (an engine with its own prefix cache: vLLM shares prefixes itself)
         self.prefix_stats = {"requests": 0, "prefix_tokens": 0, "reads": 0}
         if model is not None and self.prefix_cache:
             try:
@@ -406,16 +410,26 @@ class DecisionModel:
     def load(cls, path: str, adapter: str | None = None, device: str = "cuda", dtype: str = "bfloat16",
              quantize: str | None = None, attn_implementation: str | None = "sdpa",
              max_batch_tokens: int = 32768, compile: bool = False, think: dict | None | bool = None,
-             merge: bool | None = None) -> "DecisionModel":
+             merge: bool | None = None, reader: str | None = None, vllm_quant: str | None = None) -> "DecisionModel":
         """think: a think config (dict), False to switch it off, None to use the model's config.
         merge: merge the adapter into the weights (default: yes, unless thinking or a pair read needs the base
-        model)."""
+        model).
+        reader: "hf" (this process reads the letters) or "vllm" (a vLLM server does, chon.vllm_reader; 1.7.0); default
+        $CHON_READER, else the config's "reader", else "hf". vllm_quant: "fp8" for vLLM's online FP8 weights
+        ($CHON_VLLM_QUANT; the Decision Index sample read the same within 0.5 points, a third faster on average)."""
         device = resolve_device(device)
         path = resolve_package(path)
         own = read_model_config(path)
         if adapter is None and own.get("base_model") and os.path.exists(os.path.join(path, "adapter_config.json")):
             adapter, path = path, own["base_model"]  # a release package: adapter + config, base model by name
         cfg = {**read_model_config(path), **(read_model_config(adapter) if adapter else {})}
+        reader = reader or os.environ.get("CHON_READER") or cfg.get("reader") or "hf"
+        if reader == "vllm":
+            if vllm_quant:
+                os.environ["CHON_VLLM_QUANT"] = vllm_quant
+            return cls._load_vllm(path, adapter, cfg, max_batch_tokens)
+        if reader != "hf":
+            raise ValueError(f"unknown reader {reader!r} (hf or vllm)")
         if think is False:
             cfg.pop("think", None)
         elif think:
@@ -466,6 +480,24 @@ class DecisionModel:
                 print(f"[think] vLLM unavailable: reasoning with engine {dm.think['engine']!r}")
         return dm
 
+    @classmethod
+    def _load_vllm(cls, path: str, adapter: str | None, cfg: dict, max_batch_tokens: int) -> "DecisionModel":
+        """The letters read by a vLLM server of the (merged) model; the prompt, temperatures and rules stay here."""
+        from . import vllm_reader
+
+        if cfg.pop("think", None):
+            print("[reader/vllm] 'think when unsure' needs the HF model: switched off with the vLLM reader", flush=True)
+        tok_dir = adapter if adapter and os.path.exists(os.path.join(adapter, "tokenizer_config.json")) else path
+        tok = load_tokenizer(tok_dir)
+        served = vllm_reader.merged_dir(path, adapter) if adapter else path
+        if cfg.get("uncap_logits"):   # read under the soft cap, as the HF reader does (uncap_logits)
+            served = vllm_reader.uncapped(resolve_package(served))
+        backend = vllm_reader.start(served, cfg.get("vllm_reader"))
+        dm = cls(None, tok, cfg, device="cpu", max_batch_tokens=max_batch_tokens, backend=backend)
+        probe = dm.builder.encode("probe", {"type": "noul", "instructions": "probe"}, ["yes", "no"])
+        backend.check(probe, dm.builder.letter_ids[:2])
+        return dm
+
     # ------------------------------------------------------------------ core
     def layout_for(self, n_questions: int) -> str:
         """The layout for one of n_questions (distinct) questions asked about the same state."""
@@ -503,8 +535,11 @@ class DecisionModel:
     @torch.inference_mode()
     def raw_logits(self, seqs: Sequence[Sequence[int]], n_options: Sequence[int],
                    letter_ids: torch.Tensor | None = None) -> list[list[float]]:
-        """Letter logits for each sequence (first n_options letters), batched by padded token budget."""
+        """Letter logits for each sequence (first n_options letters), batched by padded token budget. With a backend
+        (vLLM) its letter log-probabilities, which give the same distribution after the softmax."""
         letter_ids = self.letter_ids if letter_ids is None else letter_ids
+        if self.backend is not None:
+            return self.backend.letter_logprobs(seqs, n_options, letter_ids)
         out: list[list[float] | None] = [None] * len(seqs)
         chunk = prefill_chunk()
         if chunk > 0 and not self._prefix_off:   # a long prompt: its prefix fills the cache in chunks (1.5.2)

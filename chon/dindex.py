@@ -56,11 +56,13 @@ class ChonEngine(Engine):
                "excludes model loading.")
 
     def __init__(self, model="ninhnv/chon-1.0-12b", device="cuda", think=False, max_state_tokens=32768,
-                 max_batch_tokens=32768, noul_commit=False, prefix_cache=None, **options):
+                 max_batch_tokens=32768, noul_commit=False, prefix_cache=None, reader=None, vllm_quant=None,
+                 **options):
         """prefix_cache: None = the model's setting (chon_config.json "prefix_cache", default on); true / false
         overrides it. noul_commit: false (default) = no yes/no commit band, true = the model's own (chon_config.json
-        "noul_commit"), "LO,HI" = this band (0 < LO < 0.5 < HI < 1). Options from the kit's --option key=value arrive
-        as strings ("false" is off)."""
+        "noul_commit"), "LO,HI" = this band (0 < LO < 0.5 < HI < 1). reader: "vllm" reads the letters through a vLLM
+        server of the merged model (chon.vllm_reader, 1.7.0), vllm_quant "fp8" with its online FP8 weights; default our
+        own reader. Options from the kit's --option key=value arrive as strings ("false" is off)."""
         super().__init__(**options)
         import torch
 
@@ -71,7 +73,8 @@ class ChonEngine(Engine):
             band = parse_noul_commit(noul_commit)   # checked before the model loads
         think, noul_commit = flag(think), band is not None or flag(noul_commit)
         self.dm = DecisionModel.load(model, device=device, think=None if think else False,
-                                     max_batch_tokens=int(max_batch_tokens))
+                                     max_batch_tokens=int(max_batch_tokens), reader=reader or None,
+                                     vllm_quant=vllm_quant or None)
         self.dm.builder.max_state_tokens = int(max_state_tokens)
         self.dm.cfg["truncate"] = False
         if prefix_cache is not None and str(prefix_cache).strip() != "":
@@ -149,6 +152,8 @@ class ChonEngine(Engine):
             "post_temperatures": self.dm.post_temperatures,
             "prompt_layout": self.dm.layout, "prompt_style": self.dm.style, "uncap_logits": self.dm.uncapped,
             "pair": pair, "reread": rr, "prefix_cache": self.dm.prefix_cache,
+            "reader": "vllm" if self.dm.backend is not None else "hf",
+            "vllm_quant": (os.environ.get("CHON_VLLM_QUANT") or None) if self.dm.backend is not None else None,
             "policy": "One read per question of the option letters (A-P) at the end of one fixed prompt "
                       f"(layout {self.dm.layout!r}: {layout_text}); " + style_text +
                       "choices with more than 16 options are read in groups of at most 16, then a final round "
