@@ -348,6 +348,10 @@ bf16 the 31B needs 0.94 on a 96 GB card to hold one 90,000-token request). A mod
 are the same ones. Not with "think when unsure" (the reasoning needs this process's model) or a pair read. `/health`
 reports the reader.
 
+If vLLM is not installed or its server does not start, Chon reads with its own model instead (the same answers,
+slower), says so on the log, and records why in `/health` and the engine's provenance (`reader_fallback`). Set
+`CHON_VLLM_STRICT=1` to stop instead, for example when timing the vLLM reader.
+
 Measured on one RTX PRO 6000 (96 GB), Chon-1.1-31B with its second read, half of a fixed 20,000-request sample of the
 public Decision Index suite one request at a time, paired with our own reader on the same rows and machine:
 

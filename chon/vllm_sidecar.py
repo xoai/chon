@@ -196,6 +196,10 @@ def ensure(base_model: str, cfg: dict | None = None) -> str | None:
             _log("vLLM did not come up in time; stopping it")
             _tail(log_path)
             proc.terminate()
+            try:
+                proc.wait(timeout=60)   # its GPU memory free before anything else loads
+            except Exception:  # noqa: BLE001
+                proc.kill()
             return None
         _log(f"vLLM exited with code {proc.returncode} during start-up after {time.time() - t0:.0f} s "
              f"(see {log_path})")

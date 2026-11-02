@@ -88,6 +88,10 @@ class DeadlineExceeded(RuntimeError):
         self.tokens = tokens
 
 
+def _truthy(v) -> bool:
+    return str(v or "").strip().lower() not in ("", "0", "false", "no", "off")
+
+
 def log_softmax(xs: Sequence[float]) -> list[float]:
     m = max(xs)
     z = math.log(sum(math.exp(x - m) for x in xs))
@@ -303,6 +307,7 @@ class DecisionModel:
         self.model = model
         # another engine reads the letters (chon.vllm_reader: --reader vllm, 1.7.0); None = this process's model
         self.backend = backend
+        self.reader_fallback = None   # set by load() when vLLM was asked for and could not start
         self.tok = tokenizer
         self.cfg = cfg
         self.name = cfg.get("name", name)
@@ -424,10 +429,23 @@ class DecisionModel:
             adapter, path = path, own["base_model"]  # a release package: adapter + config, base model by name
         cfg = {**read_model_config(path), **(read_model_config(adapter) if adapter else {})}
         reader = reader or os.environ.get("CHON_READER") or cfg.get("reader") or "hf"
+        fallback = None
         if reader == "vllm":
             if vllm_quant:
                 os.environ["CHON_VLLM_QUANT"] = vllm_quant
-            return cls._load_vllm(path, adapter, cfg, max_batch_tokens)
+            try:
+                return cls._load_vllm(path, adapter, dict(cfg), max_batch_tokens)
+            except Exception as e:  # (no vLLM installed, a server that would not start, a failed check)
+                # CHON_VLLM_STRICT=1 (or the config's vllm_reader.strict): stop instead, e.g. a measurement of the
+                # vLLM reader that must not quietly become a measurement of ours
+                if _truthy(os.environ.get("CHON_VLLM_STRICT")) or (cfg.get("vllm_reader") or {}).get("strict"):
+                    raise
+                from . import vllm_sidecar
+                vllm_sidecar._stop_all()   # a server this process started frees its GPU memory first
+                fallback = f"{type(e).__name__}: {str(e)[:300]}"
+                print(f"[reader/vllm] the vLLM reader could not start ({fallback}); reading with this process's "
+                      f"model instead (the same answers, slower)", flush=True)
+                reader = "hf"
         if reader != "hf":
             raise ValueError(f"unknown reader {reader!r} (hf or vllm)")
         if think is False:
@@ -467,6 +485,7 @@ class DecisionModel:
         if compile:
             model.forward = torch.compile(model.forward, dynamic=True)
         dm = cls(model, tok, cfg, device=device, max_batch_tokens=max_batch_tokens)
+        dm.reader_fallback = fallback   # why vLLM was asked for and not used (provenance), else None
         if dm.think and dm.think.get("engine") in ("vllm", "hf-static") and not str(device).startswith("cuda"):
             dm.think["engine"] = "hf"  # CPU: plain generate (vLLM and the compiled static cache are GPU paths)
         elif dm.think and dm.think.get("engine") == "vllm" and not dm.think.get("vllm_url"):

@@ -154,6 +154,7 @@ class ChonEngine(Engine):
             "pair": pair, "reread": rr, "prefix_cache": self.dm.prefix_cache,
             "reader": "vllm" if self.dm.backend is not None else "hf",
             "vllm_quant": (os.environ.get("CHON_VLLM_QUANT") or None) if self.dm.backend is not None else None,
+            "reader_fallback": getattr(self.dm, "reader_fallback", None),
             "policy": "One read per question of the option letters (A-P) at the end of one fixed prompt "
                       f"(layout {self.dm.layout!r}: {layout_text}); " + style_text +
                       "choices with more than 16 options are read in groups of at most 16, then a final round "

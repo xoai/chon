@@ -125,3 +125,41 @@ def test_engine_and_server_take_the_reader_options():
     assert '"--reader"' in serve and '"--vllm-quant"' in serve and "vllm_quant=args.vllm_quant" in serve
     reader = open(os.path.join(ROOT, "chon", "vllm_reader.py")).read()
     assert '"-m", "chon.merge"' in reader and "from chon import vllm_sidecar" in reader
+
+
+def test_a_vllm_reader_that_cannot_start_falls_back_to_ours(tiny_model_dir, monkeypatch):
+    """1.7.0: no vLLM, or a server that does not come up, reads with this process's model (the same answers) and says
+    so; CHON_VLLM_STRICT=1 stops instead (a measurement of the vLLM reader must not become one of ours)."""
+    from chon import infer, vllm_reader, vllm_sidecar
+    stopped = []
+
+    def no_server(served, cfg=None):
+        raise RuntimeError("no vLLM reader server could start")
+
+    monkeypatch.setattr(vllm_reader, "start", no_server)
+    monkeypatch.setattr(vllm_sidecar, "_stop_all", lambda: stopped.append(1))
+    monkeypatch.delenv("CHON_VLLM_STRICT", raising=False)
+    ref = infer.DecisionModel.load(tiny_model_dir, device="cpu", dtype="float32")
+    dm = infer.DecisionModel.load(tiny_model_dir, device="cpu", dtype="float32", reader="vllm", vllm_quant="fp8")
+    assert dm.backend is None and dm.model is not None and stopped == [1]
+    assert dm.reader_fallback.startswith("RuntimeError: no vLLM reader server could start")
+    assert ref.reader_fallback is None
+    a, _ = ref.predict("state", {"q": _q()})
+    b, _ = dm.predict("state", {"q": _q()})
+    assert a["q"]["probabilities"] == b["q"]["probabilities"]
+    monkeypatch.setenv("CHON_VLLM_STRICT", "1")
+    with pytest.raises(RuntimeError, match="server could start"):
+        infer.DecisionModel.load(tiny_model_dir, device="cpu", dtype="float32", reader="vllm")
+    monkeypatch.setenv("CHON_VLLM_STRICT", "0")
+    monkeypatch.setattr(vllm_reader, "start", lambda served, cfg=None: (_ for _ in ()).throw(ImportError("no vllm")))
+    dm = infer.DecisionModel.load(tiny_model_dir, device="cpu", dtype="float32", reader="vllm")
+    assert dm.reader_fallback == "ImportError: no vllm"
+
+
+def test_the_engine_records_a_fallback(tiny_model_dir, monkeypatch):
+    from chon import dindex, vllm_reader
+    monkeypatch.setattr(vllm_reader, "start", lambda served, cfg=None: (_ for _ in ()).throw(RuntimeError("down")))
+    monkeypatch.delenv("CHON_VLLM_STRICT", raising=False)
+    eng = dindex.ChonEngine(model=tiny_model_dir, device="cpu", reader="vllm", vllm_quant="fp8")
+    assert eng.provenance["reader"] == "hf" and eng.provenance["reader_fallback"] == "RuntimeError: down"
+    assert eng.provenance["vllm_quant"] is None

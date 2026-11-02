@@ -63,6 +63,7 @@ def create_app(model, api_key: str | None = None, deadline_s: float = 0.0):
                 "reader": "vllm" if getattr(model, "backend", None) is not None else "hf",
                 "vllm_quant": (os.environ.get("CHON_VLLM_QUANT") or None) if getattr(model, "backend", None) is not None
                 else None,
+                "reader_fallback": getattr(model, "reader_fallback", None),
                 "prefix_stats": dict(getattr(model, "prefix_stats", {}) or {})}
 
     @app.get("/v1/models")
