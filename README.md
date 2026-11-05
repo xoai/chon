@@ -364,6 +364,41 @@ public Decision Index suite one request at a time, paired with our own reader on
 JevBench hard read 88.3 with our reader and 89.2 with vLLM FP8; held-out and the development sets were unchanged.
 The gain is FP8's (the card's FP8 tensor cores); vLLM in bf16 is close to this process.
 
+### Many options and read-twice (1.8.0)
+
+Two settings of models trained from 5 Nov 2026, in their `chon_config.json` (`"prompt_version": 3`; 1.7.0 and older
+would read such a model with the wrong prompt, so this code refuses prompt versions newer than it knows):
+
+- `"max_options": 255` reads up to that many options in one pass. The options are coded A-Z, then with the
+  two-letter codes AA, AB, ... that are one token right after the prompt (Gemma 4 has 653 of them), so the
+  77 intents of a banking request or the 151 of CLINC150 are read at once instead of in groups of 16 and a final
+  round. A choice with more options than codes is still read in groups. The vLLM reader asks the server for that
+  many log-probabilities (`--max-logprobs`). "Think when unsure" is not used on a choice with more than 16 options.
+- `"twice_max_chars": 12000` writes a request of at most that many characters (its header list and state) twice in
+  the header layout, then the question asked, so every token of the second copy sees the whole request:
+
+  ```
+  Questions that will be asked about the context:          (the decider style)
+  - ...
+  Context:
+  <state>
+
+  Read the same input again before answering:
+  Questions that will be asked about the context:
+  - ...
+  Context:
+  <state>
+
+  Question: ...
+  ```
+
+  (the chon style: the header and state, `Read the request again:`, the header and state, the question). The
+  questions about one state still share the doubled request as their common prefix, so the shared-prefix read and
+  vLLM's prefix cache keep working. A longer request is written once. A second read ("twice") of such a model reads
+  the header layout twice as before, a layout it was not trained on: these models are meant to be read without one.
+
+A model without these keys reads exactly as before.
+
 ### Docker
 
 `docker/Dockerfile.serve` builds an image with both environments (the server and vLLM):
@@ -465,7 +500,9 @@ as the training code's shared-prefix read (`tests/golden_prefix.json`, `make_gol
 path's probabilities within 1e-4, for every parity case and for states longer than the sliding window. The
 cases cover both prompt styles, uncapped letters on the tiny model given a soft cap, the reverse and rotated second
 reads, temperatures per category (every level, bin and state kind), and the pair read on the tiny model with a tiny
-LoRA adapter (`tiny_model.tiny_adapter`, its weights seeded like the model's).
+LoRA adapter (`tiny_model.tiny_adapter`, its weights seeded like the model's). `tests/test_many_options_twice.py` covers 1.8.0's settings:
+the read-twice reads are golden cases too, and the option codes are checked on a tiny tokenizer that holds them
+(`build_tiny_model(wide_labels=True)`).
 
 ## Licence
 

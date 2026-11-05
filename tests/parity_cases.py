@@ -430,6 +430,29 @@ ROTATE_CASES = [
 CASES = CASES + ROTATE_CASES
 
 
+# ---- read-twice (1.8.0, prompt_version 3): in the header layout a request (its question list and state) of at most
+# twice_max_chars characters written twice, then the question asked ("header_twice"); a longer one once
+TW = {"twice_max_chars": 1500}
+TWICE_CASES = [
+    _p("tw_dec_header", "header", {"route": ROUTE, "within": WITHIN, "severe": SEVERE, "team": DICT_INSTR}, **DEC, **TW),
+    _p("tw_dec_header_json", "header", {"route": ROUTE, "within": WITHIN}, state=ARRAY_STATE, **DEC, **TW),
+    _p("tw_dec_header_over", "header", {"route": ROUTE, "within": WITHIN}, state=ARRAY_STATE, **DEC,
+       twice_max_chars=60),
+    _p("tw_dec_header_many", "header", {"line": MANY, "route": ROUTE, "within": WITHIN}, **DEC, **TW),
+    _p("tw_dec_hybrid_one", "hybrid_header", {"within": WITHIN}, **DEC, **TW),
+    _p("tw_dec_hybrid_multi", "hybrid_header", {"route": ROUTE, "within": WITHIN}, **DEC, **TW),
+    _p("tw_dec_reread", "header", {"route": ROUTE, "within": WITHIN}, reread=RR_ALL, **DEC, **TW),
+    _p("tw_dec_uncapped", "header", {"route": ROUTE, "within": WITHIN, "severe": SEVERE}, softcap=CAP, **DEC, **UNCAP,
+       **TW),
+    _p("tw_chon_header", "header", {"route": ROUTE, "within": WITHIN, "severe": SEVERE}, **TW),
+    _p("tw_chon_header_conv", "header", {"route": ROUTE, "within": WITHIN}, state=CONV_STATE, **TW),
+    _p("tw_state_first_unchanged", "state_first", {"route": ROUTE, "within": WITHIN}, **DEC, **TW),
+    _d("tw_dist_dec_header", "header", [(TEXT_STATE, ROUTE, None), (ARRAY_STATE, WITHIN, None),
+                                        (TEXT_STATE, SEVERE, None), (CONV_STATE, BARE_NOUL, None)], **DEC, **TW),
+]
+CASES = CASES + TWICE_CASES
+
+
 # ---- the shared-prefix read: every case above with it on, plus states longer than the tiny model's 64-token sliding
 # window (so the cached prefix crosses it) -----------------------------------------------------------------------------
 LONG_STATE = " ".join(f"Parcel {i} weighs {i % 7} kg and goes to depot {i % 3}." for i in range(30))
@@ -452,6 +475,12 @@ PREFIX_EXTRA = [
                                       (LONG_JSON, ROUTE, None), (TEXT_STATE, WITHIN, None)]),
     _d("long_dist_state_first", "state_first", [(LONG_STATE, ROUTE, None), (LONG_STATE, WITHIN, None),
                                                 (LONG_STATE, SEVERE, None)], reread=RR_ALL),
+]
+PREFIX_EXTRA += [   # read-twice with long states: the doubled request crosses the sliding window
+    _p("long_tw_dec_header", "header", {"route": ROUTE, "within": WITHIN, "severe": SEVERE}, state=LONG_JSON, **DEC,
+       twice_max_chars=4000),
+    _p("long_tw_dec_many", "header", {"line": MANY, "route": ROUTE}, state=LONG_STATE, **DEC, twice_max_chars=4000),
+    _p("long_tw_chon_header", "header", {"route": ROUTE, "within": WITHIN}, state=LONG_STATE, twice_max_chars=4000),
 ]
 PREFIX_EXTRA += [   # the decider style, long states
     _p("long_dec_state_first", "state_first", {"route": ROUTE, "within": WITHIN, "severe": SEVERE, "team": DICT_INSTR},

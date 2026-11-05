@@ -76,6 +76,8 @@ from .prefix import (SharedPrefix, Unsupported, check_supported, common_prefix, 
 from .prompt import INLINE_PREFIX, INLINE_SUFFIX, PROMPT_STYLES, REREAD_LAYOUTS, PromptBuilder, suffix_letter_ids
 from .schema import MAX_OPTIONS, CapacityError, ItemError, options_for, validate_item
 
+PROMPT_VERSION_READ = 3   # the newest chon_config.json "prompt_version" this code reads (3: max_options, twice_max_chars)
+
 PROMPT_LAYOUTS = ("state_first", "header", "hybrid_header")
 
 
@@ -318,9 +320,14 @@ class DecisionModel:
         if self.style not in PROMPT_STYLES:
             raise ValueError(f"unknown prompt_style {self.style!r} in the model config (one of {PROMPT_STYLES}); "
                              f"this model needs a newer version of the chon serving code")
+        if int(cfg.get("prompt_version") or 1) > PROMPT_VERSION_READ:
+            raise ValueError(f"prompt_version {cfg['prompt_version']} in the model config (this code reads up to "
+                             f"{PROMPT_VERSION_READ}); this model needs a newer version of the chon serving code")
         self.builder = PromptBuilder(tokenizer, max_state_tokens=cfg.get("max_state_tokens", 6000),
                                      chat_template_kwargs=cfg.get("chat_template_kwargs"),
-                                     answer_prefix=cfg.get("answer_prefix", ""), style=self.style)
+                                     answer_prefix=cfg.get("answer_prefix", ""), style=self.style,
+                                     max_options=cfg.get("max_options", MAX_OPTIONS),
+                                     twice_max_chars=cfg.get("twice_max_chars", 0))
         # "uncap_logits": the letters are read with the final logit soft cap off, as the model was trained
         self.uncapped = bool(cfg.get("uncap_logits"))
         if self.uncapped and model is not None:
@@ -511,7 +518,9 @@ class DecisionModel:
         served = vllm_reader.merged_dir(path, adapter) if adapter else path
         if cfg.get("uncap_logits"):   # read under the soft cap, as the HF reader does (uncap_logits)
             served = vllm_reader.uncapped(resolve_package(served))
-        backend = vllm_reader.start(served, cfg.get("vllm_reader"))
+        vr = dict(cfg.get("vllm_reader") or {})
+        vr.setdefault("max_logprobs", int(cfg.get("max_options", MAX_OPTIONS)))   # one log-prob per option code
+        backend = vllm_reader.start(served, vr)
         dm = cls(None, tok, cfg, device="cpu", max_batch_tokens=max_batch_tokens, backend=backend)
         probe = dm.builder.encode("probe", {"type": "noul", "instructions": "probe"}, ["yes", "no"])
         backend.check(probe, dm.builder.letter_ids[:2])
@@ -805,7 +814,8 @@ class DecisionModel:
         gen_tokens: list[int | None] = [None] * len(seqs)
         if not self.think:
             return gen_tokens
-        idx = [i for i in range(len(seqs)) if self.unsure(qtypes[i], orders[i], probs[i])]
+        idx = [i for i in range(len(seqs)) if self.unsure(qtypes[i], orders[i], probs[i])
+               and len(orders[i]) <= MAX_OPTIONS]   # (the letters read after the reasoning are A-P)
         max_share = self.think.get("max_share")
         if max_share is not None:  # questions in arrival order, one request at a time
             keep = []
@@ -994,8 +1004,8 @@ class DecisionModel:
         """One read of a request (predict's semantics).
         deadline: a time.monotonic() by which to answer (chon.serve sets it from the request's arrival): the
         one-pass answers always stand; a second read or the reasoning of unsure answers runs only if it fits before it.
-        A choice with more than MAX_OPTIONS options (up to MAX_OPTIONS ** 2) is read in groups, then a final round
-        between the group winners (_predict_many). cfg "truncate": false refuses a state over max_state_tokens with
+        A choice with more options than the model has codes (16, or max_options: up to that number squared) is read
+        in groups, then a final round between the group winners (_predict_many). cfg "truncate": false refuses a state over max_state_tokens with
         a CapacityError instead of cutting it. A header model lists the request's questions in every read of this
         request, the groups and final rounds included: in the chon style the distinct instructions in request order,
         in the decider style every question's instructions in request order (PromptBuilder.asked_list)."""
@@ -1003,12 +1013,13 @@ class DecisionModel:
             raise ItemError("questions must be a non-empty object")
         names = list(questions)
         many: dict[str, dict] = {}
+        one = len(self.builder.codes)   # options read in one pass
         for n in names:
             q = questions[n]
             big = (isinstance(q, dict) and q.get("type") == "choice" and isinstance(q.get("criteria"), (dict, list))
-                   and len(q["criteria"]) > MAX_OPTIONS and self.cfg.get("many_options", True))
+                   and len(q["criteria"]) > one and self.cfg.get("many_options", True))
             validate_item({"id": n, "state": state, "question": q}, require_expected=False, allow_empty_state=True,
-                          max_options=MAX_OPTIONS ** 2 if big else None)
+                          max_options=one ** 2 if big else one)
             if big:
                 many[n] = q
         if state is None:
@@ -1084,11 +1095,11 @@ class DecisionModel:
         return self._finish_many(state, self._plan_many(state, qs, fitted), fitted)
 
     def _plan_many(self, state: Any, qs: dict[str, dict], fitted: str):
-        """Groups of at most MAX_OPTIONS options per big choice and the first-round sequences."""
+        """Groups of at most len(codes) options per big choice and the first-round sequences."""
         plan, seqs, owner = [], [], []
         for n, q in qs.items():
             opts = options_for(q)
-            k = math.ceil(len(opts) / MAX_OPTIONS)
+            k = math.ceil(len(opts) / len(self.builder.codes))
             size = math.ceil(len(opts) / k)
             groups = [opts[i:i + size] for i in range(0, len(opts), size)]
             plan.append((n, q, groups))
@@ -1098,7 +1109,7 @@ class DecisionModel:
         return plan, seqs, owner
 
     def _finish_many(self, state: Any, planned, fitted: str) -> tuple[dict, int]:
-        """Choices with more than MAX_OPTIONS options: each group of at most MAX_OPTIONS options is read as its own
+        """Choices with more options than the codes: each group of at most len(codes) options is read as its own
         question, then one final question between the group winners. P(option) = P(its group wins the final) x
         P(option | its group), so every option gets a probability and they sum to 1. No thinking on these. Both
         rounds read through the request's shared prefix when one is prepared. The temperature: the category of the

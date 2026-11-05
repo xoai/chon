@@ -46,17 +46,32 @@ Prompt style "decider" (PromptBuilder `style`; chosen by chon_config.json "promp
 
 and the letter is read after "Answer: (" at the start of the reply. Layouts: state_first, header, and their second
 reads twice / twice_header (the whole user turn, "Read the same input again before answering:", then it again).
+
+Two settings of models trained from 5 Nov (chon_config.json, prompt_version 3; a model without them reads as before):
+
+    max_options      up to that many options (16 to 255) read in one pass, coded A-Z and then the two-letter codes
+                     AA, AB, ... that are one token at the reply boundary (beyond them, in groups as before)
+    twice_max_chars  in the header layout, a request (its question list and state) of at most that many characters
+                     is written twice, then the question asked ("header_twice"): chon style
+                     "<header and state>Read the request again:\n\n<header and state><question>", decider style
+                     "<header>Context:\n<state>" + "Read the same input again before answering:" + it again, then the
+                     question. The questions about one state still share the doubled request as a prefix.
 """
 
 from __future__ import annotations
 
 import json
+import string
 from typing import Any, Sequence
 
 from .schema import MAX_OPTIONS, instructions_text, options_for
 
 PROMPT_VERSION = 1
 LETTERS = "ABCDEFGHIJKLMNOP"[:MAX_OPTIONS]
+# many options in one pass (max_options > 16): the codes A-Z, then the two-letter codes AA, AB, ... that are one token at
+# the reply boundary (Gemma 4: 26 letters and 653 such codes). Up to 16 options the codes are the letters above.
+MAX_CODES = 255
+CODE_CANDIDATES = list(string.ascii_uppercase) + [a + b for a in string.ascii_uppercase for b in string.ascii_uppercase]
 TRUNC_HEAD = "\n[... truncated]"
 TRUNC_CONV = "[earlier messages omitted]\n"
 ANSWER_LINE = "Answer with one letter."
@@ -102,14 +117,14 @@ def _dec_txt(v: Any) -> str:
     return v if isinstance(v, str) else json.dumps(v, ensure_ascii=False)
 
 
-def decider_question_text(question: dict, order: Sequence[str]) -> str:
+def decider_question_text(question: dict, order: Sequence[str], codes: Sequence[str] = LETTERS) -> str:
     """'Question: <instructions>\\nOptions:\\n(A) key: description ...' (a noul question's options are yes / no)."""
     raw = question.get("instructions")
     text = DEC_NOUL_TEXT if question.get("type") == "noul" and raw in (None, "") else _dec_txt(raw if raw is not None else "")
     opts = dict(options_for(question))
     hide = question.get("option_keys") == "hide"
     lines = [f"Question: {text}", "Options:"]
-    for letter, label in zip(LETTERS, order):
+    for letter, label in zip(codes, order):
         desc = opts[label]
         lines.append(f"({letter}) {desc}" if desc and hide else f"({letter}) {label}: {desc}" if desc else f"({letter}) {label}")
     return "\n".join(lines)
@@ -152,11 +167,11 @@ def state_text(state: Any) -> str:
     return json.dumps(state, ensure_ascii=False, separators=(",", ":"))
 
 
-def question_text(question: dict, order: Sequence[str]) -> str:
+def question_text(question: dict, order: Sequence[str], codes: Sequence[str] = LETTERS) -> str:
     opts = dict(options_for(question))
     lines = [f"Question: {instructions_text(question)}"]
     hide = question.get("option_keys") == "hide"  # keys are ids (e.g. "0", "1"): show only the descriptions
-    for letter, label in zip(LETTERS, order):
+    for letter, label in zip(codes, order):
         desc = opts[label]
         if desc and hide:
             lines.append(f"{letter}) {desc}")
@@ -170,7 +185,8 @@ class PromptBuilder:
     """Builds token ids for (state, question, option order) and knows the letter token ids."""
 
     def __init__(self, tokenizer, max_state_tokens: int = 6000, chat_template_kwargs: dict | None = None,
-                 answer_prefix: str = "", style: str = "chon"):
+                 answer_prefix: str = "", style: str = "chon", max_options: int = MAX_OPTIONS,
+                 twice_max_chars: int = 0):
         if style not in PROMPT_STYLES:
             raise ValueError(f"unknown prompt_style {style!r} (one of {PROMPT_STYLES})")
         self.tok = tokenizer
@@ -178,9 +194,19 @@ class PromptBuilder:
         self.max_state_tokens = int(max_state_tokens)
         self.chat_template_kwargs = {"enable_thinking": False} if chat_template_kwargs is None else dict(chat_template_kwargs)
         self.answer_prefix = DEC_ANSWER if style == "decider" else answer_prefix
+        # read-twice (twice_max_chars > 0): a header request of at most that many characters is written twice
+        self.twice_max_chars = int(twice_max_chars or 0)
+        self.max_options = int(max_options or MAX_OPTIONS)
+        if not MAX_OPTIONS <= self.max_options <= MAX_CODES:
+            raise ValueError(f"max_options is {MAX_OPTIONS} to {MAX_CODES}, not {self.max_options}")
         if not getattr(tokenizer, "chat_template", None):
             raise ValueError("tokenizer has no chat template; use the instruct (-it) checkpoint's tokenizer")
-        self.letter_ids = self._find_letter_ids()
+        self.codes = list(LETTERS)   # (render reads self.codes; the boundary probe has two options)
+        if self.max_options > MAX_OPTIONS:
+            self.codes, self.letter_ids = self._find_codes()
+        else:
+            self.letter_ids = self._find_letter_ids()
+            self.codes = list(LETTERS[:len(self.letter_ids)])
 
     # ---- text ---------------------------------------------------------------------------------
     def _n_tokens(self, text: str) -> int:
@@ -218,7 +244,7 @@ class PromptBuilder:
         The decider style has state_first, header, twice and twice_header (_render_decider)."""
         if self.style == "decider":
             return self._render_decider(state_txt, question, order, layout, asked)
-        q = question_text(question, order)
+        q = question_text(question, order, self.codes)
         head = q[: -len(ANSWER_LINE)].rstrip("\n")
         if layout == "state_first":
             content = f"{state_txt}\n\n---\n{q}"
@@ -226,16 +252,27 @@ class PromptBuilder:
             content = f"{state_txt}\n\n---\n{head}\n\n{REREAD_LINE}\n\n{state_txt}\n\n---\n{q}"
         elif layout == "sandwich":
             content = f"{head}\n---\n{state_txt}\n\n---\n{q}"
-        elif layout in ("header", "twice_header"):
+        elif layout in ("header", "twice_header", "header_twice"):
             lst = [" ".join(str(a).split()) for a in (asked or [instructions_text(question)])]
             top = HEADER_LINE + "\n" + "\n".join(f"- {a}" for a in lst) + f"\n---\n{state_txt}\n\n---\n"
-            content = top + q if layout == "header" else f"{top}{head}\n\n{REREAD_LINE}\n\n{top}{q}"
+            if layout == "header" and self.twice(top):
+                layout = "header_twice"
+            if layout == "header":
+                content = top + q
+            elif layout == "twice_header":
+                content = f"{top}{head}\n\n{REREAD_LINE}\n\n{top}{q}"
+            else:   # the request twice, then the question: siblings share the doubled request
+                content = f"{top}{REREAD_LINE}\n\n{top}{q}"
         else:
             raise ValueError(f"unknown prompt layout {layout!r}")
         msgs = [{"role": "user", "content": content}]
         text = self.tok.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True,
                                             **self.chat_template_kwargs)
         return text + self.answer_prefix
+
+    def twice(self, request_text: str) -> bool:
+        """Is this request written twice? (header layout, read-twice on, at most twice_max_chars characters)"""
+        return bool(self.twice_max_chars) and len(request_text) <= self.twice_max_chars
 
     def natural_order(self, question: dict) -> list[str]:
         """The option order a request is read in: the criteria's, with yes/no questions shown as (A) no, (B) yes in the
@@ -253,15 +290,22 @@ class PromptBuilder:
     def _render_decider(self, state_txt: str, question: dict, order: Sequence[str], layout: str,
                         asked: Sequence[str] | None) -> str:
         """The decider style: state_first, header, and their second reads (twice, twice_header)."""
-        if layout not in ("state_first", "header", "twice", "twice_header"):
+        if layout not in ("state_first", "header", "twice", "twice_header", "header_twice"):
             raise ValueError(f"prompt_style 'decider' has no {layout!r} layout")
         top = ""
-        if layout in ("header", "twice_header"):
+        if layout in ("header", "twice_header", "header_twice"):
             lst = list(asked) if asked else [decider_question_label(question)]
             top = DEC_HEADER + "\n" + "\n".join(f"- {a}" for a in lst) + "\n\n"
-        user = f"{top}Context:\n{state_txt}\n\n{decider_question_text(question, order)}"
-        if layout in ("twice", "twice_header"):
-            user = user + DEC_AGAIN + user
+        req = f"{top}Context:\n{state_txt}"
+        qtext = decider_question_text(question, order, self.codes)
+        if layout == "header" and self.twice(req):
+            layout = "header_twice"
+        if layout == "header_twice":   # the request twice, then the question: siblings share the doubled request
+            user = f"{req}{DEC_AGAIN}{req}\n\n{qtext}"
+        else:
+            user = f"{req}\n\n{qtext}"
+            if layout in ("twice", "twice_header"):
+                user = user + DEC_AGAIN + user
         text = self.tok.apply_chat_template([{"role": "user", "content": user}], tokenize=False,
                                             add_generation_prompt=True, **self.chat_template_kwargs)
         return text + self.answer_prefix
@@ -277,6 +321,24 @@ class PromptBuilder:
         return self.tok(self.render(st, question, order, layout, asked), add_special_tokens=False)["input_ids"]
 
     # ---- letters ------------------------------------------------------------------------------
+    def _find_codes(self) -> tuple[list[str], list[int]]:
+        """max_options > 16: the codes (A-Z, then two-letter codes) that are one token at the reply boundary, distinct,
+        in CODE_CANDIDATES order, up to max_options. Fewer available than max_options is an error: training and
+        serving must agree on the codes."""
+        probe = self.render("probe", {"type": "noul", "instructions": "probe"}, ["yes", "no"])
+        base = self.tok(probe, add_special_tokens=False)["input_ids"]
+        codes, ids, seen = [], [], set()
+        for code in CODE_CANDIDATES:
+            full = self.tok(probe + code, add_special_tokens=False)["input_ids"]
+            if len(full) == len(base) + 1 and full[: len(base)] == base and full[-1] not in seen:
+                codes.append(code)
+                ids.append(full[-1])
+                seen.add(full[-1])
+                if len(codes) == self.max_options:
+                    return codes, ids
+        raise ValueError(f"only {len(codes)} option codes are one token at the reply boundary; max_options is "
+                         f"{self.max_options}")
+
     def _find_letter_ids(self) -> list[int]:
         """Token id of each letter as the first token of the reply.
 

@@ -55,7 +55,9 @@ def make_items(n: int, seed: int = 0, prefix: str = "t") -> list[dict]:
     return items
 
 
-def build_tiny_model(out: str) -> str:
+def build_tiny_model(out: str, wide_labels: bool = False) -> str:
+    """wide_labels: the vocabulary also holds the option codes A-Z and AA, AB, ... as single tokens, as Gemma 4's does
+    (the many-options tests; the training repository's fixture of the same name). The golden values use the default."""
     import torch
     from tokenizers import Tokenizer, decoders, models, pre_tokenizers, trainers
     from transformers import (Gemma4Config, Gemma4ForConditionalGeneration, Gemma4TextConfig,
@@ -70,8 +72,13 @@ def build_tiny_model(out: str) -> str:
     tok = Tokenizer(models.BPE())
     tok.pre_tokenizer = pre_tokenizers.ByteLevel(add_prefix_space=False)
     tok.decoder = decoders.ByteLevel()
+    if wide_labels:
+        import string
+        names = [a + b for a in string.ascii_uppercase for b in string.ascii_uppercase][:260]
+        corpus += [" ".join(f"\n({n}) {n}" for n in names)] * 4
     tok.train_from_iterator(corpus * 5, trainers.BpeTrainer(
-        vocab_size=700, special_tokens=["<pad>", "<eos>", "<bos>", "<start_of_turn>", "<end_of_turn>"],
+        vocab_size=1600 if wide_labels else 700,
+        special_tokens=["<pad>", "<eos>", "<bos>", "<start_of_turn>", "<end_of_turn>"],
         initial_alphabet=pre_tokenizers.ByteLevel.alphabet()))
     ft = PreTrainedTokenizerFast(tokenizer_object=tok, bos_token="<bos>", eos_token="<eos>", pad_token="<pad>")
     ft.chat_template = CHAT_TEMPLATE

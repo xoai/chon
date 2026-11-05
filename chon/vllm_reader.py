@@ -146,7 +146,9 @@ def start(model_dir: str, cfg: dict | None = None) -> VLLMReader:
     side = {"served_name": SERVED_NAME, "gpu_memory_utilization": float(os.environ.get("CHON_VLLM_MEM", cfg.get(
                 "gpu_memory_utilization", 0.85))), "reserve_gb": 1, "min_free_gb": 12,
             "max_model_len": int(os.environ.get("CHON_VLLM_MAX_LEN", cfg.get("max_model_len", 34816))),
-            "extra_args": ["--logprobs-mode", "processed_logprobs", "--max-logprobs", "20",
+            # every option code's log-prob is returned: up to 255 for a model read with many options (max_options)
+            "extra_args": ["--logprobs-mode", "processed_logprobs",
+                           "--max-logprobs", str(max(20, int(cfg.get("max_logprobs", 20)))),
                            "--generation-config", "vllm", *cfg.get("extra_args", [])],   # vLLM's neutral defaults
             "start_timeout_s": cfg.get("start_timeout_s", 2400)}
     if quant and quant != "none":
