@@ -442,6 +442,10 @@ TWICE_CASES = [
     _p("tw_dec_hybrid_one", "hybrid_header", {"within": WITHIN}, **DEC, **TW),
     _p("tw_dec_hybrid_multi", "hybrid_header", {"route": ROUTE, "within": WITHIN}, **DEC, **TW),
     _p("tw_dec_reread", "header", {"route": ROUTE, "within": WITHIN}, reread=RR_ALL, **DEC, **TW),
+    # FlexDM-LoRA 2.1's second read (round 3's -rrv6): below 0.6, the options reversed, the doubled prompt kept
+    _p("tw_dec_reverse_below", "header", {"route": ROUTE, "within": WITHIN, "severe": SEVERE, "line": MANY},
+       reread={"below": 0.6, "layout": "reverse", "max_tokens": 131072, "combine": "avg"}, **DEC, **TW),
+    _p("tw_dec_reverse_all", "header", {"route": ROUTE, "within": WITHIN}, state=ARRAY_STATE, reread=RRV, **DEC, **TW),
     _p("tw_dec_uncapped", "header", {"route": ROUTE, "within": WITHIN, "severe": SEVERE}, softcap=CAP, **DEC, **UNCAP,
        **TW),
     _p("tw_chon_header", "header", {"route": ROUTE, "within": WITHIN, "severe": SEVERE}, **TW),
